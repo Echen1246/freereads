@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -15,10 +16,25 @@ enum TtsStatus {
   error,
 }
 
+/// Pre-generated audio chunk ready for playback
+class _AudioChunk {
+  final Int16List pcmData;
+  final int sampleRate;
+  final double duration;
+  
+  _AudioChunk({
+    required this.pcmData,
+    required this.sampleRate,
+    required this.duration,
+  });
+}
+
 /// Text-to-Speech engine using Kokoro TTS and SoLoud audio.
 /// 
 /// This class wraps kokoro_tts_flutter for phonemization and ONNX inference,
 /// and flutter_soloud for low-latency PCM audio streaming.
+/// 
+/// Uses pre-buffering to minimize gaps between chunks.
 class TtsEngine {
   /// Kokoro TTS instance
   Kokoro? _kokoro;
@@ -37,6 +53,12 @@ class TtsEngine {
   
   /// Speech rate (0.5 - 2.0)
   double _rate = 1.0;
+  
+  /// Pre-buffered audio chunks ready to play
+  final Queue<_AudioChunk> _audioBuffer = Queue<_AudioChunk>();
+  
+  /// Number of chunks to pre-buffer before starting playback
+  static const int _preBufferCount = 2;
 
   // Stream controller for status updates
   final _statusController = StreamController<TtsStatus>.broadcast();
@@ -138,9 +160,33 @@ class TtsEngine {
   /// Using 150 chars to stay safely under the 510 phoneme limit.
   static const int _maxChunkChars = 150;
 
-  /// Speaks the given text.
+  /// Generates audio for a single text chunk.
+  Future<_AudioChunk?> _generateChunk(String text) async {
+    if (_kokoro == null || _currentVoiceId == null) return null;
+    if (text.trim().isEmpty) return null;
+    
+    try {
+      final result = await _kokoro!.createTTS(
+        text: text,
+        voice: _currentVoiceId!,
+        speed: _rate,
+        lang: 'en-us',
+      );
+      
+      return _AudioChunk(
+        pcmData: result.toInt16PCM(),
+        sampleRate: result.sampleRate,
+        duration: result.duration,
+      );
+    } catch (e) {
+      debugPrint('[TTS] Error generating chunk: $e');
+      return null;
+    }
+  }
+
+  /// Speaks the given text with pre-buffered streaming.
   /// 
-  /// Automatically chunks long text to stay within model limits.
+  /// Pre-generates chunks ahead of playback to minimize gaps.
   /// Returns the generated audio duration in seconds.
   Future<double> speak(String text) async {
     if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
@@ -152,45 +198,89 @@ class TtsEngine {
     }
 
     await stop();
+    _audioBuffer.clear();
     _setStatus(TtsStatus.speaking);
 
     try {
       // Split text into chunks that fit within model limits
       final chunks = _chunkText(text);
+      final totalChunks = chunks.length;
       double totalDuration = 0;
+      int generateIndex = 0;
+      int playIndex = 0;
       
-      // Process and play each chunk sequentially (streaming approach)
-      for (int i = 0; i < chunks.length; i++) {
-        final chunk = chunks[i];
-        if (chunk.trim().isEmpty) continue;
-        
-        // Check if we've been stopped
+      debugPrint('[TTS] Starting buffered playback: $totalChunks chunks, pre-buffering $_preBufferCount');
+      
+      // Phase 1: Pre-buffer initial chunks before starting playback
+      while (generateIndex < totalChunks && _audioBuffer.length < _preBufferCount) {
         if (_status != TtsStatus.speaking) break;
         
-        debugPrint('[TTS] Processing chunk ${i + 1}/${chunks.length}: "${chunk.substring(0, chunk.length > 30 ? 30 : chunk.length)}..."');
+        final chunk = chunks[generateIndex];
+        debugPrint('[TTS] Pre-buffering chunk ${generateIndex + 1}/$totalChunks...');
         
-        final result = await _kokoro!.createTTS(
-          text: chunk,
-          voice: _currentVoiceId!,
-          speed: _rate,
-          lang: 'en-us',
-        );
-        
-        totalDuration += result.duration;
-        final pcmData = result.toInt16PCM();
-        
-        debugPrint('[TTS] Generated ${pcmData.length} samples, playing...');
-        
-        // Play this chunk immediately and wait for it to finish
-        await _playPcmInt16AndWait(pcmData, sampleRate: result.sampleRate);
-        
-        debugPrint('[TTS] Chunk ${i + 1} finished playing');
+        final audio = await _generateChunk(chunk);
+        if (audio != null) {
+          _audioBuffer.addLast(audio);
+          totalDuration += audio.duration;
+        }
+        generateIndex++;
       }
       
+      debugPrint('[TTS] Pre-buffer complete, ${_audioBuffer.length} chunks ready. Starting playback...');
+      
+      // Phase 2: Play and generate in overlapping fashion
+      while (playIndex < totalChunks && _status == TtsStatus.speaking) {
+        // Play next chunk from buffer if available
+        if (_audioBuffer.isNotEmpty) {
+          final audio = _audioBuffer.removeFirst();
+          playIndex++;
+          
+          debugPrint('[TTS] Playing chunk $playIndex/$totalChunks (${audio.duration.toStringAsFixed(2)}s), buffer: ${_audioBuffer.length}');
+          
+          // Start playback (non-blocking initially)
+          final playFuture = _playPcmInt16AndWait(audio.pcmData, sampleRate: audio.sampleRate);
+          
+          // While audio plays, generate the next chunk if needed
+          if (generateIndex < totalChunks && _audioBuffer.length < _preBufferCount) {
+            final chunk = chunks[generateIndex];
+            debugPrint('[TTS] Generating chunk ${generateIndex + 1}/$totalChunks while playing...');
+            
+            final nextAudio = await _generateChunk(chunk);
+            if (nextAudio != null) {
+              _audioBuffer.addLast(nextAudio);
+              totalDuration += nextAudio.duration;
+            }
+            generateIndex++;
+          }
+          
+          // Wait for current audio to finish
+          await playFuture;
+          debugPrint('[TTS] Chunk $playIndex finished');
+        } else if (generateIndex < totalChunks) {
+          // Buffer empty but more to generate - generate and play immediately
+          final chunk = chunks[generateIndex];
+          debugPrint('[TTS] Buffer empty, generating chunk ${generateIndex + 1}/$totalChunks directly...');
+          
+          final audio = await _generateChunk(chunk);
+          generateIndex++;
+          
+          if (audio != null) {
+            totalDuration += audio.duration;
+            playIndex++;
+            await _playPcmInt16AndWait(audio.pcmData, sampleRate: audio.sampleRate);
+          }
+        } else {
+          break;
+        }
+      }
+      
+      _audioBuffer.clear();
       _setStatus(TtsStatus.ready);
+      debugPrint('[TTS] Playback complete. Total duration: ${totalDuration.toStringAsFixed(2)}s');
       return totalDuration;
     } catch (e) {
       debugPrint('[TTS] Error during speak: $e');
+      _audioBuffer.clear();
       _setStatus(TtsStatus.error);
       rethrow;
     }
@@ -417,6 +507,9 @@ class TtsEngine {
 
   /// Stops current speech and clears buffers.
   Future<void> stop() async {
+    // Clear the pre-buffer
+    _audioBuffer.clear();
+    
     if (_currentHandle != null && _soloud != null) {
       _soloud!.stop(_currentHandle!);
       _currentHandle = null;
@@ -448,6 +541,7 @@ class TtsEngine {
   Future<void> dispose() async {
     debugPrint('[TTS] Disposing TTS engine...');
     await stop();
+    _audioBuffer.clear();
     
     // Dispose Kokoro TTS
     await _kokoro?.dispose();

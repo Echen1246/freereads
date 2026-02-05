@@ -403,17 +403,66 @@ class _ReaderScreenState extends State<ReaderScreen> {
             _buildSheetHandle(context),
             const SizedBox(height: 16),
             Text('Playback Speed', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 16),
-            ...[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((speed) => ListTile(
-              title: Text('${speed}x'),
-              trailing: _playbackSpeed == speed
-                  ? Icon(Icons.check, color: Theme.of(context).colorScheme.primary)
-                  : null,
-              onTap: () {
-                _setPlaybackSpeed(speed);
-                Navigator.of(context).pop();
+            const SizedBox(height: 24),
+            StatefulBuilder(
+              builder: (context, setSheetState) {
+                return Column(
+                  children: [
+                    Text(
+                      '${_playbackSpeed.toStringAsFixed(2)}x',
+                      style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Row(
+                        children: [
+                          const Text('0.5x'),
+                          Expanded(
+                            child: Slider(
+                              value: _playbackSpeed,
+                              min: 0.5,
+                              max: 2.0,
+                              divisions: 30, // 0.05 increments
+                              onChanged: (value) {
+                                setSheetState(() {});
+                                _setPlaybackSpeed(value);
+                              },
+                            ),
+                          ),
+                          const Text('2.0x'),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    // Quick preset buttons
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [0.75, 0.9, 1.0, 1.1, 1.25].map((speed) => 
+                          TextButton(
+                            onPressed: () {
+                              setSheetState(() {});
+                              _setPlaybackSpeed(speed);
+                            },
+                            style: TextButton.styleFrom(
+                              backgroundColor: (_playbackSpeed - speed).abs() < 0.01
+                                  ? Theme.of(context).colorScheme.primaryContainer
+                                  : null,
+                            ),
+                            child: Text('${speed}x'),
+                          ),
+                        ).toList(),
+                      ),
+                    ),
+                  ],
+                );
               },
-            )),
+            ),
             const SizedBox(height: 16),
           ],
         ),

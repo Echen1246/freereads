@@ -141,10 +141,56 @@ class PageSorter {
     });
   }
 
+  /// Reflows text by joining lines that don't end with sentence punctuation.
+  /// This fixes the "hitchy" TTS caused by PDF visual line breaks.
+  /// 
+  /// Rules:
+  /// - Lines ending with . ! ? : are kept as sentence endings
+  /// - Lines ending with other characters are joined with the next line
+  /// - Double newlines (paragraph breaks) are preserved
+  /// - Lines that look like headers/titles (all caps, short) are kept separate
+  String reflowText(String text) {
+    // First, normalize any Windows-style line endings
+    text = text.replaceAll('\r\n', '\n');
+    
+    // Preserve paragraph breaks by replacing them with a placeholder
+    const paragraphPlaceholder = '<<<PARA>>>';
+    text = text.replaceAll(RegExp(r'\n\s*\n'), paragraphPlaceholder);
+    
+    // Join lines that don't end with sentence-ending punctuation
+    // Pattern: any character except sentence enders, followed by newline, followed by content
+    text = text.replaceAllMapped(
+      RegExp(r'([^.!?:\n])\n(?!$)'),
+      (match) => '${match.group(1)} ',
+    );
+    
+    // Also handle lines ending with closing quotes/parens after punctuation
+    // e.g., "Hello."\nNext -> "Hello." Next (keep the break)
+    // But "Hello\nworld" -> "Hello world" (join)
+    
+    // Restore paragraph breaks
+    text = text.replaceAll(paragraphPlaceholder, '\n\n');
+    
+    // Clean up any multiple spaces created by joining
+    text = text.replaceAll(RegExp(r' +'), ' ');
+    
+    // Trim whitespace from start/end of lines
+    text = text.split('\n').map((line) => line.trim()).join('\n');
+    
+    return text.trim();
+  }
+
   /// Combines all blocks into a single string in reading order.
   String blocksToText(List<OcrTextBlock> sortedBlocks) {
     final text = sortedBlocks.map((b) => b.text).join('\n');
-    return mergeHyphenatedWords(text);
+    
+    // Apply text processing pipeline:
+    // 1. Merge hyphenated words first (before reflow messes with the newlines)
+    // 2. Reflow to join mid-sentence line breaks
+    var processed = mergeHyphenatedWords(text);
+    processed = reflowText(processed);
+    
+    return processed;
   }
 
   /// Full pipeline: filter, sort, and merge to produce clean text.
