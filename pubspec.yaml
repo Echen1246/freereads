@@ -1,0 +1,57 @@
+name: freereads
+description: "Local-only audiobook app - convert PDFs to human-quality audio"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  
+  # PDF Rendering
+  pdfrx: ^1.0.97
+  
+  # OCR
+  google_mlkit_text_recognition: ^0.15.0
+  
+  # TTS (Kokoro + phonemization)
+  kokoro_tts_flutter: ^0.2.0+1
+  
+  # Audio playback
+  flutter_soloud: ^3.2.3
+  
+  # Storage
+  sqflite: ^2.4.2
+  
+  # File system utilities
+  path_provider: ^2.1.5
+  path: ^1.9.1
+  
+  # File picker for importing PDFs
+  file_picker: ^8.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+# Override with local patched version to fix Float32List type casting bug
+dependency_overrides:
+  kokoro_tts_flutter:
+    path: packages/kokoro_tts_flutter
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/models/
+    - assets/sample/
+    # TTS dictionary files (required by kokoro_tts_flutter)
+    - assets/tokenizer_vocab.json
+    - assets/lexicon.json
+    - assets/us_gold.json
+    - assets/us_silver.json
