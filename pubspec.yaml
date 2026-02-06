@@ -33,6 +33,12 @@ dependencies:
   
   # File picker for importing PDFs
   file_picker: ^8.0.0
+  
+  # FFI for native library bindings (espeak-ng)
+  ffi: ^2.1.0
+  
+  # Archive extraction (for espeak-ng-data.zip)
+  archive: ^4.0.4
 
 dev_dependencies:
   flutter_test:
@@ -55,3 +61,5 @@ flutter:
     - assets/lexicon.json
     - assets/us_gold.json
     - assets/us_silver.json
+    # espeak-ng data (extracted on first launch)
+    - assets/espeak-ng-data.zip

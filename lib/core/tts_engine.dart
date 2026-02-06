@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:kokoro_tts_flutter/kokoro_tts_flutter.dart';
+
+import 'espeak_phonemizer.dart';
 
 /// TTS Engine status
 enum TtsStatus {
@@ -68,6 +71,9 @@ class TtsEngine {
   /// Available voice IDs after initialization
   List<String> get availableVoices => _kokoro?.getVoices() ?? [];
 
+  /// Whether espeak-ng phonemizer is available (Android only for now)
+  bool _useEspeak = false;
+
   /// Initialize the TTS engine.
   /// 
   /// [modelPath] - Path to the ONNX model file (e.g., 'assets/models/model.onnx')
@@ -87,6 +93,20 @@ class TtsEngine {
     _setStatus(TtsStatus.initializing);
     
     try {
+      // Initialize espeak-ng phonemizer (Android only for now)
+      if (Platform.isAndroid) {
+        debugPrint('[TTS] Initializing espeak-ng phonemizer...');
+        _useEspeak = await EspeakPhonemizer.initialize();
+        if (_useEspeak) {
+          debugPrint('[TTS] espeak-ng phonemizer ready - HuggingFace quality enabled!');
+        } else {
+          debugPrint('[TTS] espeak-ng failed to initialize, falling back to malsami');
+        }
+      } else {
+        debugPrint('[TTS] espeak-ng not available on this platform, using malsami');
+        _useEspeak = false;
+      }
+
       // Initialize SoLoud audio engine
       _soloud = SoLoud.instance;
       
@@ -166,11 +186,28 @@ class TtsEngine {
     if (text.trim().isEmpty) return null;
     
     try {
+      // Use espeak-ng for phonemization if available (HuggingFace quality)
+      // Otherwise fall back to malsami (built into kokoro_tts_flutter)
+      String textOrPhonemes = text;
+      bool isPhonemes = false;
+      
+      if (_useEspeak) {
+        final phonemes = EspeakPhonemizer.phonemize(text);
+        if (phonemes != null && phonemes.isNotEmpty) {
+          textOrPhonemes = phonemes;
+          isPhonemes = true;
+          debugPrint('[TTS] espeak phonemes: $phonemes');
+        } else {
+          debugPrint('[TTS] espeak returned null, falling back to malsami');
+        }
+      }
+      
       final result = await _kokoro!.createTTS(
-        text: text,
+        text: textOrPhonemes,
         voice: _currentVoiceId!,
         speed: _rate,
         lang: 'en-us',
+        isPhonemes: isPhonemes,
       );
       
       return _AudioChunk(
@@ -525,6 +562,44 @@ class TtsEngine {
     _rate = rate.clamp(0.5, 2.0);
   }
 
+  /// Test method: speaks raw phonemes directly (bypasses malsami).
+  /// Use this to verify if pronunciation issues are from phonemizer or model.
+  Future<void> speakPhonemes(String phonemes) async {
+    if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
+      throw StateError('TTS engine not ready. Current status: $_status');
+    }
+    
+    if (_kokoro == null || _currentVoiceId == null) {
+      throw StateError('TTS engine not properly initialized');
+    }
+
+    await stop();
+    _setStatus(TtsStatus.speaking);
+
+    try {
+      debugPrint('[TTS TEST] Speaking raw phonemes: "$phonemes"');
+      
+      final result = await _kokoro!.createTTS(
+        text: phonemes,
+        voice: _currentVoiceId!,
+        speed: _rate,
+        lang: 'en-us',
+        isPhonemes: true,  // Bypass phonemizer!
+      );
+      
+      final pcmData = result.toInt16PCM();
+      debugPrint('[TTS TEST] Generated ${pcmData.length} samples');
+      
+      await _playPcmInt16AndWait(pcmData, sampleRate: result.sampleRate);
+      
+      _setStatus(TtsStatus.ready);
+    } catch (e) {
+      debugPrint('[TTS TEST] Error: $e');
+      _setStatus(TtsStatus.error);
+      rethrow;
+    }
+  }
+
   /// Sets the volume (0.0 to 1.0).
   void setVolume(double volume) {
     if (_soloud != null) {
@@ -542,6 +617,12 @@ class TtsEngine {
     debugPrint('[TTS] Disposing TTS engine...');
     await stop();
     _audioBuffer.clear();
+    
+    // Dispose espeak-ng phonemizer
+    if (_useEspeak) {
+      EspeakPhonemizer.dispose();
+      _useEspeak = false;
+    }
     
     // Dispose Kokoro TTS
     await _kokoro?.dispose();

@@ -388,6 +388,100 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _ttsEngine.setRate(speed);
   }
 
+  /// Test: speak "countries" with correct phonemes to verify if model or phonemizer is the issue
+  Future<void> _runPhonemeTest() async {
+    if (_ttsEngine.status != TtsStatus.ready) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('TTS not ready')),
+      );
+      return;
+    }
+
+    // Show test options
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildSheetHandle(ctx),
+              const SizedBox(height: 16),
+              Text('Phoneme Test', style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              Text(
+                'Test if the issue is the phonemizer (malsami) or the model (Kokoro).',
+                style: Theme.of(ctx).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.text_fields),
+                title: const Text('Say "countries" (via malsami)'),
+                subtitle: const Text('Uses our phonemizer'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await _ttsEngine.speak('countries');
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Error: $e')),
+                      );
+                    }
+                  }
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.music_note),
+                title: const Text('Say "countries" (correct phonemes)'),
+                subtitle: const Text('Bypasses malsami: kˈʌntɹiz'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await _ttsEngine.speakPhonemes('kˈʌntɹiz');
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Error: $e')),
+                      );
+                    }
+                  }
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.music_note),
+                title: const Text('Say full sentence (correct phonemes)'),
+                subtitle: const Text('Both countries sound natural'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    // "I am sure that no two countries are more alike"
+                    await _ttsEngine.speakPhonemes(
+                      'aɪ æm ʃʊɹ ðæt noʊ tuː kˈʌntɹiz ɑɹ mɔɹ əlaɪk.'
+                    );
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Error: $e')),
+                      );
+                    }
+                  }
+                },
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   void _showSpeedDialog() {
     showModalBottomSheet(
       context: context,
@@ -571,6 +665,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     ),
                   ),
                   const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.science),
+                    onPressed: _runPhonemeTest,
+                    tooltip: 'Test Phonemes',
+                  ),
                   IconButton(
                     icon: const Icon(Icons.tune),
                     onPressed: _showCalibrationSheet,
