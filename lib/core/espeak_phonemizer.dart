@@ -58,6 +58,9 @@ const int espeakCHARS_UTF8 = 1;
 /// Phoneme output modes
 const int espeakPHONEMES_IPA = 0x02;
 
+/// Phoneme mode with tie bar (U+0361) between multi-character phonemes
+const int espeakPHONEMES_TIE = 0x08;
+
 // ============================================================================
 // EspeakPhonemizer Class
 // ============================================================================
@@ -203,9 +206,85 @@ class EspeakPhonemizer {
 
   /// Punctuation that should be preserved for prosody/pauses
   static final _punctuationPattern = RegExp(r'([.!?;:,])');
+
+  // ===========================================================================
+  // Misaki-compatible phoneme conversion (from_espeak)
+  // ===========================================================================
+  // Kokoro was trained on "misaki" phonemes, not raw espeak IPA.
+  // This converts espeak IPA → Kokoro's 45-phoneme vocabulary.
+  // Source: https://github.com/hexgrad/misaki/blob/main/EN_PHONES.md
+  // ===========================================================================
+
+  /// Unicode tie bar character that espeak uses between multi-character phonemes
+  static const String _tie = '\u0361';  // combining double inverted breve ͡
+  /// We normalize to ^ for easier string matching (matches Python phonemizer)
+  static const String _tieReplace = '^';
+
+  /// espeak → misaki replacements, sorted longest-first for correct matching.
+  /// The ^ character represents the tie bar between phoneme components.
+  static final List<MapEntry<String, String>> _fromEspeakMap = [
+    // Longest replacements first (3+ chars)
+    MapEntry('ʔˌn\u0329', 'tᵊn'),  // glottal stop + secondary stress + syllabic n
+    MapEntry('ʔn', 'tᵊn'),          // glottal stop + n
+    MapEntry('a^ɪ', 'I'),           // diphthong: "eye"
+    MapEntry('a^ʊ', 'W'),           // diphthong: "how"
+    MapEntry('d^ʒ', 'ʤ'),           // affricate: "jump"
+    MapEntry('e^ɪ', 'A'),           // diphthong: "hey"
+    MapEntry('t^ʃ', 'ʧ'),           // affricate: "church"
+    MapEntry('ɔ^ɪ', 'Y'),           // diphthong: "boy"
+    MapEntry('ə^l', 'ᵊl'),          // syllabic l
+    MapEntry('ʲO', 'jO'),           // palatalization before O (keep)
+    MapEntry('ʲQ', 'jQ'),           // palatalization before Q (keep)
+    // Shorter replacements
+    MapEntry('\u0303', ''),          // remove nasal tilde
+    MapEntry('e', 'A'),              // plain e → A
+    MapEntry('r', 'ɹ'),             // r → ɹ
+    MapEntry('x', 'k'),              // x → k
+    MapEntry('ç', 'k'),              // ç → k
+    MapEntry('ɐ', 'ə'),             // near-open central → schwa
+    MapEntry('ɚ', 'əɹ'),            // rhotacized schwa
+    MapEntry('ɬ', 'l'),              // lateral fricative → l
+    MapEntry('ʔ', 't'),              // glottal stop → t
+    MapEntry('ʲ', ''),               // remove palatalization (after ʲO/ʲQ handled)
+  ];
+
+  /// Convert raw espeak IPA phonemes to Kokoro's misaki phoneme set
+  static String _fromEspeak(String ps, {bool british = false}) {
+    // Apply the sorted replacement map
+    for (final entry in _fromEspeakMap) {
+      ps = ps.replaceAll(entry.key, entry.value);
+    }
+    
+    // Handle syllabic consonant marker U+0329 (combining vertical line below)
+    // Pattern: any non-space char followed by U+0329 → insert ᵊ before it
+    ps = ps.replaceAllMapped(
+      RegExp(r'(\S)\u0329'),
+      (m) => 'ᵊ${m.group(1)}',
+    );
+    ps = ps.replaceAll('\u0329', '');  // remove any remaining
+    
+    if (british) {
+      ps = ps.replaceAll('e^ə', 'ɛː');
+      ps = ps.replaceAll('iə', 'ɪə');
+      ps = ps.replaceAll('ə^ʊ', 'Q');
+    } else {
+      // American English
+      ps = ps.replaceAll('o^ʊ', 'O');   // "oh" diphthong
+      ps = ps.replaceAll('ɜːɹ', 'ɜɹ');  // remove length mark before ɹ
+      ps = ps.replaceAll('ɜː', 'ɜɹ');   // ɜː always becomes ɜɹ in American
+      ps = ps.replaceAll('ɪə', 'iə');   // ɪə → iə
+      ps = ps.replaceAll('ː', '');       // remove all remaining length marks
+    }
+    
+    // Remove any remaining tie characters
+    ps = ps.replaceAll(_tieReplace, '');
+    
+    return ps;
+  }
   
-  /// Convert text to IPA phonemes, preserving punctuation for proper pauses
-  /// Returns the phoneme string, or null on error
+  /// Convert text to IPA phonemes, preserving punctuation for proper pauses.
+  /// Output uses Kokoro's misaki phoneme set (not raw espeak IPA).
+  /// Returns the phoneme string, or null on error.
   static String? phonemize(String text, {String language = 'en-us'}) {
     if (!_initialized) {
       print('[EspeakPhonemizer] Not initialized, call initialize() first');
@@ -280,7 +359,9 @@ class EspeakPhonemizer {
     }
   }
   
-  /// Internal: phonemize a single text segment (no punctuation)
+  /// Internal: phonemize a single text segment (no punctuation).
+  /// Returns raw espeak IPA with tie chars normalized to ^, then converted
+  /// to Kokoro's misaki phoneme vocabulary.
   static String? _phonemizeSegment(String text) {
     if (text.isEmpty) return '';
     
@@ -292,10 +373,12 @@ class EspeakPhonemizer {
     // Collect all phonemes
     final phonemeBuffer = StringBuffer();
 
+    // phonememode: IPA (0x02) + tie bar (0x08) = 0x0A
+    const phonemeMode = espeakPHONEMES_IPA | espeakPHONEMES_TIE;
+
     while (textPtrPtr.value != nullptr && textPtrPtr.value.address != 0) {
       // Get phonemes for next chunk
-      // textmode = 1 (UTF8), phonememode = 0x02 (IPA)
-      final resultPtr = _textToPhonemes!(textPtrPtr, espeakCHARS_UTF8, espeakPHONEMES_IPA);
+      final resultPtr = _textToPhonemes!(textPtrPtr, espeakCHARS_UTF8, phonemeMode);
 
       if (resultPtr != nullptr && resultPtr.address != 0) {
         final chunk = resultPtr.toDartString();
@@ -318,12 +401,20 @@ class EspeakPhonemizer {
       }
     }
 
-    // Cleanup
+    // Cleanup native memory
     calloc.free(textPtr);
     calloc.free(textPtrPtr);
     // Note: resultPtr is managed by espeak, don't free it
 
-    return phonemeBuffer.toString().trim();
+    // Convert raw espeak IPA → Kokoro misaki phonemes
+    String rawPhonemes = phonemeBuffer.toString().trim();
+    // Normalize tie bar U+0361 → ^ for consistent replacement matching
+    rawPhonemes = rawPhonemes.replaceAll(_tie, _tieReplace);
+    
+    final bool british = false; // We use American English
+    final misakiPhonemes = _fromEspeak(rawPhonemes, british: british);
+    
+    return misakiPhonemes;
   }
 
   /// Cleanup resources

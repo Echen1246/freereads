@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:kokoro_tts_flutter/kokoro_tts_flutter.dart';
 
@@ -74,6 +76,25 @@ class TtsEngine {
   /// Whether espeak-ng phonemizer is available (Android only for now)
   bool _useEspeak = false;
 
+  /// Tokenizer vocabulary: phoneme character → token ID.
+  /// Loaded from assets/tokenizer_vocab.json to enable token-level splitting.
+  Map<String, int> _vocab = {};
+
+  // =========================================================================
+  // Token IDs for smart splitting
+  // =========================================================================
+  /// Sentence-ending punctuation: . ! ?
+  static const Set<int> _sentenceEndTokens = {4, 5, 6};
+  /// Phrase-level breaks: ; : ,
+  static const Set<int> _phraseBreakTokens = {1, 2, 3};
+  /// Space token
+  static const int _spaceToken = 16;
+  /// Max tokens per batch.  The Kokoro model accepts up to 510, but ONNX
+  /// inference runs on the Android platform thread (method channel limitation).
+  /// Batches >~250 tokens can exceed Android's 5-second ANR timeout on mobile
+  /// devices, so we cap at 200 for safety.
+  static const int _maxTokensPerBatch = 200;
+
   /// Initialize the TTS engine.
   /// 
   /// [modelPath] - Path to the ONNX model file (e.g., 'assets/models/model.onnx')
@@ -100,10 +121,10 @@ class TtsEngine {
         if (_useEspeak) {
           debugPrint('[TTS] espeak-ng phonemizer ready - HuggingFace quality enabled!');
         } else {
-          debugPrint('[TTS] espeak-ng failed to initialize, falling back to malsami');
+          debugPrint('[TTS] espeak-ng failed to initialize, using built-in phonemizer');
         }
       } else {
-        debugPrint('[TTS] espeak-ng not available on this platform, using malsami');
+        debugPrint('[TTS] espeak-ng not available on this platform, using built-in phonemizer');
         _useEspeak = false;
       }
 
@@ -133,6 +154,12 @@ class TtsEngine {
       
       _kokoro = Kokoro(config);
       await _kokoro!.initialize();
+      
+      // Load tokenizer vocab for token-level splitting
+      final vocabJson = await rootBundle.loadString('assets/tokenizer_vocab.json');
+      final vocabMap = jsonDecode(vocabJson) as Map<String, dynamic>;
+      _vocab = vocabMap.map((k, v) => MapEntry(k, v as int));
+      debugPrint('[TTS] Loaded tokenizer vocab: ${_vocab.length} entries');
       
       // Set default voice (first available)
       final voices = _kokoro!.getVoices();
@@ -175,61 +202,220 @@ class TtsEngine {
     _currentVoiceId = voiceId;
   }
 
-  /// Maximum characters per chunk (conservative estimate to stay under 510 phonemes)
-  /// After phonemization, each character can expand to 1-3 phonemes on average.
-  /// Using 150 chars to stay safely under the 510 phoneme limit.
-  static const int _maxChunkChars = 150;
+  // ===========================================================================
+  // Phonemization + Token-level splitting pipeline
+  // ===========================================================================
+  //
+  // New architecture (replaces old character-count chunking):
+  //   1. Phonemize entire page text at once via espeak-ng
+  //   2. Walk the phoneme string, counting actual tokens via vocab
+  //   3. Split at sentence boundaries (.!?) staying under 510 tokens
+  //   4. Each batch → createTTS(isPhonemes: true) → audio
+  //
+  // This maximizes context per model call and ensures clean prosody breaks.
+  // ===========================================================================
 
-  /// Generates audio for a single text chunk.
-  Future<_AudioChunk?> _generateChunk(String text) async {
-    if (_kokoro == null || _currentVoiceId == null) return null;
-    if (text.trim().isEmpty) return null;
+  /// Prepares phoneme batches from raw text.
+  /// Returns (list of batches, whether they are phoneme strings).
+  /// 
+  /// When espeak-ng is available: phonemizes all text at once, then splits
+  /// the phoneme string into ≤510-token batches at sentence boundaries.
+  /// 
+  /// Fallback (no espeak): splits raw text conservatively by sentences
+  /// and lets Kokoro's built-in phonemizer handle each chunk.
+  (List<String> batches, bool isPhonemes) _prepareBatches(String text) {
+    if (_useEspeak) {
+      final phonemes = EspeakPhonemizer.phonemize(text);
+      if (phonemes != null && phonemes.isNotEmpty) {
+        debugPrint('[TTS] Full phonemes (${phonemes.length} chars): ${phonemes.length > 80 ? '${phonemes.substring(0, 80)}...' : phonemes}');
+        final batches = _splitPhonemesAtBoundaries(phonemes);
+        debugPrint('[TTS] Split into ${batches.length} batches');
+        return (batches, true);
+      }
+      debugPrint('[TTS] espeak returned null, falling back to text chunking');
+    }
     
-    try {
-      // Use espeak-ng for phonemization if available (HuggingFace quality)
-      // Otherwise fall back to malsami (built into kokoro_tts_flutter)
-      String textOrPhonemes = text;
-      bool isPhonemes = false;
-      
-      if (_useEspeak) {
-        final phonemes = EspeakPhonemizer.phonemize(text);
-        if (phonemes != null && phonemes.isNotEmpty) {
-          textOrPhonemes = phonemes;
-          isPhonemes = true;
-          debugPrint('[TTS] espeak phonemes: $phonemes');
-        } else {
-          debugPrint('[TTS] espeak returned null, falling back to malsami');
+    // Fallback: conservative text chunking for built-in phonemizer.
+    // 150 chars ≈ stays safely under 510 tokens after phonemization.
+    return (_chunkTextFallback(text, maxChars: 150), false);
+  }
+
+  /// Splits a phoneme string into batches of at most [_maxTokensPerBatch]
+  /// tokens, preferring to split at sentence boundaries (.!?), then phrase
+  /// breaks (,;:), then spaces, and hard-splitting only as a last resort.
+  List<String> _splitPhonemesAtBoundaries(String phonemes) {
+    if (phonemes.isEmpty) return [];
+
+    // Quick check: does the whole string fit in one batch?
+    int totalTokens = 0;
+    for (int i = 0; i < phonemes.length; i++) {
+      if (_vocab.containsKey(phonemes[i])) totalTokens++;
+    }
+    if (totalTokens <= _maxTokensPerBatch) {
+      return [phonemes];
+    }
+
+    final batches = <String>[];
+    int batchStart = 0;
+    int tokenCount = 0;
+    int lastSentenceEnd = -1;
+    int lastPhraseBreak = -1;
+    int lastSpace = -1;
+
+    for (int i = 0; i < phonemes.length; i++) {
+      final char = phonemes[i];
+      final tokenId = _vocab[char];
+
+      if (tokenId != null) {
+        tokenCount++;
+
+        // Track candidate split points
+        if (_sentenceEndTokens.contains(tokenId)) {
+          lastSentenceEnd = i;
+        } else if (_phraseBreakTokens.contains(tokenId)) {
+          lastPhraseBreak = i;
+        } else if (tokenId == _spaceToken) {
+          lastSpace = i;
         }
       }
-      
+
+      // When we reach the token limit, split at the best boundary
+      if (tokenCount >= _maxTokensPerBatch) {
+        int splitAt;
+        if (lastSentenceEnd > batchStart) {
+          splitAt = lastSentenceEnd + 1; // include the punctuation
+        } else if (lastPhraseBreak > batchStart) {
+          splitAt = lastPhraseBreak + 1;
+        } else if (lastSpace > batchStart) {
+          splitAt = lastSpace + 1;
+        } else {
+          splitAt = i + 1; // hard split at current position
+        }
+
+        final batch = phonemes.substring(batchStart, splitAt).trim();
+        if (batch.isNotEmpty) {
+          batches.add(batch);
+        }
+        batchStart = splitAt;
+
+        // Recount tokens from the new start through current position
+        tokenCount = 0;
+        lastSentenceEnd = -1;
+        lastPhraseBreak = -1;
+        lastSpace = -1;
+        for (int j = batchStart; j <= i; j++) {
+          final tid = _vocab[phonemes[j]];
+          if (tid != null) {
+            tokenCount++;
+            if (_sentenceEndTokens.contains(tid)) lastSentenceEnd = j;
+            else if (_phraseBreakTokens.contains(tid)) lastPhraseBreak = j;
+            else if (tid == _spaceToken) lastSpace = j;
+          }
+        }
+      }
+    }
+
+    // Add remaining phonemes
+    if (batchStart < phonemes.length) {
+      final remaining = phonemes.substring(batchStart).trim();
+      if (remaining.isNotEmpty) {
+        batches.add(remaining);
+      }
+    }
+
+    // Log batch sizes for debugging
+    for (int i = 0; i < batches.length; i++) {
+      int tokens = 0;
+      for (int j = 0; j < batches[i].length; j++) {
+        if (_vocab.containsKey(batches[i][j])) tokens++;
+      }
+      debugPrint('[TTS] Batch ${i + 1}/${batches.length}: $tokens tokens, ${batches[i].length} chars');
+    }
+
+    return batches;
+  }
+
+  /// Fallback: chunks raw text by character count at sentence boundaries.
+  /// Used when espeak-ng is not available and Kokoro does its own phonemization.
+  List<String> _chunkTextFallback(String text, {int maxChars = 150}) {
+    if (text.length <= maxChars) return [text];
+
+    final chunks = <String>[];
+    final sentencePattern = RegExp(r'(?<=[.!?])\s+');
+    final sentences = text.split(sentencePattern);
+    var currentChunk = StringBuffer();
+
+    for (final sentence in sentences) {
+      if (currentChunk.length + sentence.length > maxChars) {
+        if (currentChunk.isNotEmpty) {
+          chunks.add(currentChunk.toString().trim());
+          currentChunk.clear();
+        }
+        if (sentence.length > maxChars) {
+          // Split long sentence by commas/spaces
+          final words = sentence.split(RegExp(r'(?<=[,;])\s*|\s+'));
+          for (final word in words) {
+            if (currentChunk.length + word.length + 1 > maxChars && currentChunk.isNotEmpty) {
+              chunks.add(currentChunk.toString().trim());
+              currentChunk.clear();
+            }
+            currentChunk.write(word);
+            currentChunk.write(' ');
+          }
+        } else {
+          currentChunk.write(sentence);
+          currentChunk.write(' ');
+        }
+      } else {
+        currentChunk.write(sentence);
+        currentChunk.write(' ');
+      }
+    }
+    if (currentChunk.isNotEmpty) {
+      chunks.add(currentChunk.toString().trim());
+    }
+    return chunks;
+  }
+
+  /// Generates audio for a single batch (phonemes or raw text).
+  Future<_AudioChunk?> _generateAudio(String batch, {required bool isPhonemes}) async {
+    if (_kokoro == null || _currentVoiceId == null) return null;
+    if (batch.trim().isEmpty) return null;
+
+    try {
       final result = await _kokoro!.createTTS(
-        text: textOrPhonemes,
+        text: batch,
         voice: _currentVoiceId!,
         speed: _rate,
         lang: 'en-us',
         isPhonemes: isPhonemes,
       );
-      
+
       return _AudioChunk(
         pcmData: result.toInt16PCM(),
         sampleRate: result.sampleRate,
         duration: result.duration,
       );
     } catch (e) {
-      debugPrint('[TTS] Error generating chunk: $e');
+      debugPrint('[TTS] Error generating audio: $e');
       return null;
     }
   }
 
   /// Speaks the given text with pre-buffered streaming.
   /// 
-  /// Pre-generates chunks ahead of playback to minimize gaps.
-  /// Returns the generated audio duration in seconds.
+  /// Pipeline:
+  ///   1. Phonemize all text at once (espeak-ng) or chunk text (fallback)
+  ///   2. Split into optimal batches at sentence boundaries
+  ///   3. Pre-generate audio chunks ahead of playback
+  ///   4. Stream playback with overlap (generate N+1 while playing N)
+  /// 
+  /// Returns the total generated audio duration in seconds.
   Future<double> speak(String text) async {
     if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
       throw StateError('TTS engine not ready. Current status: $_status');
     }
-    
+
     if (_kokoro == null || _currentVoiceId == null) {
       throw StateError('TTS engine not properly initialized');
     }
@@ -239,68 +425,61 @@ class TtsEngine {
     _setStatus(TtsStatus.speaking);
 
     try {
-      // Split text into chunks that fit within model limits
-      final chunks = _chunkText(text);
-      final totalChunks = chunks.length;
+      // Step 1: Phonemize all text and split into optimal batches
+      final (batches, isPhonemes) = _prepareBatches(text);
+      final totalBatches = batches.length;
       double totalDuration = 0;
       int generateIndex = 0;
       int playIndex = 0;
-      
-      debugPrint('[TTS] Starting buffered playback: $totalChunks chunks, pre-buffering $_preBufferCount');
-      
-      // Phase 1: Pre-buffer initial chunks before starting playback
-      while (generateIndex < totalChunks && _audioBuffer.length < _preBufferCount) {
+
+      debugPrint('[TTS] Starting playback: $totalBatches batches (phonemes=$isPhonemes), pre-buffering $_preBufferCount');
+
+      // Phase 1: Pre-buffer initial batches before starting playback
+      while (generateIndex < totalBatches && _audioBuffer.length < _preBufferCount) {
         if (_status != TtsStatus.speaking) break;
-        
-        final chunk = chunks[generateIndex];
-        debugPrint('[TTS] Pre-buffering chunk ${generateIndex + 1}/$totalChunks...');
-        
-        final audio = await _generateChunk(chunk);
+
+        debugPrint('[TTS] Pre-buffering batch ${generateIndex + 1}/$totalBatches...');
+        final audio = await _generateAudio(batches[generateIndex], isPhonemes: isPhonemes);
         if (audio != null) {
           _audioBuffer.addLast(audio);
           totalDuration += audio.duration;
         }
         generateIndex++;
       }
-      
-      debugPrint('[TTS] Pre-buffer complete, ${_audioBuffer.length} chunks ready. Starting playback...');
-      
+
+      debugPrint('[TTS] Pre-buffer complete, ${_audioBuffer.length} batches ready. Starting playback...');
+
       // Phase 2: Play and generate in overlapping fashion
-      while (playIndex < totalChunks && _status == TtsStatus.speaking) {
-        // Play next chunk from buffer if available
+      while (playIndex < totalBatches && _status == TtsStatus.speaking) {
         if (_audioBuffer.isNotEmpty) {
           final audio = _audioBuffer.removeFirst();
           playIndex++;
-          
-          debugPrint('[TTS] Playing chunk $playIndex/$totalChunks (${audio.duration.toStringAsFixed(2)}s), buffer: ${_audioBuffer.length}');
-          
-          // Start playback (non-blocking initially)
+
+          debugPrint('[TTS] Playing batch $playIndex/$totalBatches (${audio.duration.toStringAsFixed(2)}s), buffer: ${_audioBuffer.length}');
+
+          // Start playback (non-blocking)
           final playFuture = _playPcmInt16AndWait(audio.pcmData, sampleRate: audio.sampleRate);
-          
-          // While audio plays, generate the next chunk if needed
-          if (generateIndex < totalChunks && _audioBuffer.length < _preBufferCount) {
-            final chunk = chunks[generateIndex];
-            debugPrint('[TTS] Generating chunk ${generateIndex + 1}/$totalChunks while playing...');
-            
-            final nextAudio = await _generateChunk(chunk);
+
+          // While audio plays, generate the next batch if needed
+          if (generateIndex < totalBatches && _audioBuffer.length < _preBufferCount) {
+            debugPrint('[TTS] Generating batch ${generateIndex + 1}/$totalBatches while playing...');
+            final nextAudio = await _generateAudio(batches[generateIndex], isPhonemes: isPhonemes);
             if (nextAudio != null) {
               _audioBuffer.addLast(nextAudio);
               totalDuration += nextAudio.duration;
             }
             generateIndex++;
           }
-          
+
           // Wait for current audio to finish
           await playFuture;
-          debugPrint('[TTS] Chunk $playIndex finished');
-        } else if (generateIndex < totalChunks) {
-          // Buffer empty but more to generate - generate and play immediately
-          final chunk = chunks[generateIndex];
-          debugPrint('[TTS] Buffer empty, generating chunk ${generateIndex + 1}/$totalChunks directly...');
-          
-          final audio = await _generateChunk(chunk);
+          debugPrint('[TTS] Batch $playIndex finished');
+        } else if (generateIndex < totalBatches) {
+          // Buffer empty, generate and play immediately
+          debugPrint('[TTS] Buffer empty, generating batch ${generateIndex + 1}/$totalBatches directly...');
+          final audio = await _generateAudio(batches[generateIndex], isPhonemes: isPhonemes);
           generateIndex++;
-          
+
           if (audio != null) {
             totalDuration += audio.duration;
             playIndex++;
@@ -310,7 +489,7 @@ class TtsEngine {
           break;
         }
       }
-      
+
       _audioBuffer.clear();
       _setStatus(TtsStatus.ready);
       debugPrint('[TTS] Playback complete. Total duration: ${totalDuration.toStringAsFixed(2)}s');
@@ -321,111 +500,6 @@ class TtsEngine {
       _setStatus(TtsStatus.error);
       rethrow;
     }
-  }
-
-  /// Chunks text into pieces that stay under the phoneme limit.
-  /// Splits on sentence boundaries when possible.
-  List<String> _chunkText(String text) {
-    if (text.length <= _maxChunkChars) {
-      return [text];
-    }
-
-    final chunks = <String>[];
-    
-    // Split by sentence-ending punctuation, keeping the punctuation
-    final sentencePattern = RegExp(r'(?<=[.!?])\s+');
-    final sentences = text.split(sentencePattern);
-    
-    var currentChunk = StringBuffer();
-    
-    for (final sentence in sentences) {
-      // If adding this sentence would exceed limit, save current chunk
-      if (currentChunk.length + sentence.length > _maxChunkChars) {
-        if (currentChunk.isNotEmpty) {
-          chunks.add(currentChunk.toString().trim());
-          currentChunk.clear();
-        }
-        
-        // If single sentence is too long, split by phrases
-        if (sentence.length > _maxChunkChars) {
-          chunks.addAll(_splitLongSentence(sentence));
-        } else {
-          currentChunk.write(sentence);
-          currentChunk.write(' ');
-        }
-      } else {
-        currentChunk.write(sentence);
-        currentChunk.write(' ');
-      }
-    }
-    
-    // Add remaining content
-    if (currentChunk.isNotEmpty) {
-      chunks.add(currentChunk.toString().trim());
-    }
-    
-    return chunks;
-  }
-
-  /// Splits a long sentence into smaller chunks by commas/semicolons or words.
-  List<String> _splitLongSentence(String sentence) {
-    final chunks = <String>[];
-    
-    // Try splitting by commas/semicolons first
-    final phrasePattern = RegExp(r'(?<=[,;])\s*');
-    final phrases = sentence.split(phrasePattern);
-    
-    var currentChunk = StringBuffer();
-    
-    for (final phrase in phrases) {
-      if (currentChunk.length + phrase.length > _maxChunkChars) {
-        if (currentChunk.isNotEmpty) {
-          chunks.add(currentChunk.toString().trim());
-          currentChunk.clear();
-        }
-        
-        // If phrase is still too long, split by words
-        if (phrase.length > _maxChunkChars) {
-          final words = phrase.split(' ');
-          for (final word in words) {
-            if (currentChunk.length + word.length + 1 > _maxChunkChars) {
-              if (currentChunk.isNotEmpty) {
-                chunks.add(currentChunk.toString().trim());
-                currentChunk.clear();
-              }
-            }
-            currentChunk.write(word);
-            currentChunk.write(' ');
-          }
-        } else {
-          currentChunk.write(phrase);
-          currentChunk.write(' ');
-        }
-      } else {
-        currentChunk.write(phrase);
-        currentChunk.write(' ');
-      }
-    }
-    
-    if (currentChunk.isNotEmpty) {
-      chunks.add(currentChunk.toString().trim());
-    }
-    
-    return chunks;
-  }
-
-  /// Concatenates multiple PCM buffers into one.
-  Int16List _concatenatePcm(List<Int16List> buffers) {
-    final totalLength = buffers.fold<int>(0, (sum, buf) => sum + buf.length);
-    final result = Int16List(totalLength);
-    
-    var offset = 0;
-    for (final buffer in buffers) {
-      result.setRange(offset, offset + buffer.length, buffer);
-      offset += buffer.length;
-    }
-    
-    return result;
   }
 
   /// Plays Int16 PCM audio data through SoLoud and waits for completion.
@@ -560,44 +634,6 @@ class TtsEngine {
   /// Sets the speech rate (0.5 = half speed, 2.0 = double speed).
   void setRate(double rate) {
     _rate = rate.clamp(0.5, 2.0);
-  }
-
-  /// Test method: speaks raw phonemes directly (bypasses malsami).
-  /// Use this to verify if pronunciation issues are from phonemizer or model.
-  Future<void> speakPhonemes(String phonemes) async {
-    if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
-      throw StateError('TTS engine not ready. Current status: $_status');
-    }
-    
-    if (_kokoro == null || _currentVoiceId == null) {
-      throw StateError('TTS engine not properly initialized');
-    }
-
-    await stop();
-    _setStatus(TtsStatus.speaking);
-
-    try {
-      debugPrint('[TTS TEST] Speaking raw phonemes: "$phonemes"');
-      
-      final result = await _kokoro!.createTTS(
-        text: phonemes,
-        voice: _currentVoiceId!,
-        speed: _rate,
-        lang: 'en-us',
-        isPhonemes: true,  // Bypass phonemizer!
-      );
-      
-      final pcmData = result.toInt16PCM();
-      debugPrint('[TTS TEST] Generated ${pcmData.length} samples');
-      
-      await _playPcmInt16AndWait(pcmData, sampleRate: result.sampleRate);
-      
-      _setStatus(TtsStatus.ready);
-    } catch (e) {
-      debugPrint('[TTS TEST] Error: $e');
-      _setStatus(TtsStatus.error);
-      rethrow;
-    }
   }
 
   /// Sets the volume (0.0 to 1.0).

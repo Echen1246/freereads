@@ -55,11 +55,7 @@ flutter:
   
   assets:
     - assets/models/
-    - assets/sample/
-    # TTS dictionary files (required by kokoro_tts_flutter)
+    # Phoneme-to-token mapping (required by Kokoro TTS)
     - assets/tokenizer_vocab.json
-    - assets/lexicon.json
-    - assets/us_gold.json
-    - assets/us_silver.json
-    # espeak-ng data (extracted on first launch)
+    # espeak-ng phonemizer data (extracted on first launch)
     - assets/espeak-ng-data.zip
