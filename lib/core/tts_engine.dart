@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -16,22 +15,10 @@ enum TtsStatus {
   uninitialized,
   initializing,
   ready,
+  generating, // generating audio (not yet playing)
   speaking,
   paused,
   error,
-}
-
-/// Pre-generated audio chunk ready for playback
-class _AudioChunk {
-  final Int16List pcmData;
-  final int sampleRate;
-  final double duration;
-  
-  _AudioChunk({
-    required this.pcmData,
-    required this.sampleRate,
-    required this.duration,
-  });
 }
 
 /// Text-to-Speech engine using Kokoro TTS and SoLoud audio.
@@ -39,7 +26,8 @@ class _AudioChunk {
 /// This class wraps kokoro_tts_flutter for phonemization and ONNX inference,
 /// and flutter_soloud for low-latency PCM audio streaming.
 /// 
-/// Uses pre-buffering to minimize gaps between chunks.
+/// Pipeline: generates ALL batches into one concatenated PCM buffer, then
+/// plays as a single continuous stream for gapless audio.
 class TtsEngine {
   /// Kokoro TTS instance
   Kokoro? _kokoro;
@@ -52,18 +40,15 @@ class TtsEngine {
   
   /// Current audio handle for playback control
   SoundHandle? _currentHandle;
+
+  /// Current audio source (for cleanup after playback)
+  AudioSource? _currentSource;
   
   /// Current voice ID
   String? _currentVoiceId;
   
   /// Speech rate (0.5 - 2.0)
   double _rate = 1.0;
-  
-  /// Pre-buffered audio chunks ready to play
-  final Queue<_AudioChunk> _audioBuffer = Queue<_AudioChunk>();
-  
-  /// Number of chunks to pre-buffer before starting playback
-  static const int _preBufferCount = 2;
 
   // Stream controller for status updates
   final _statusController = StreamController<TtsStatus>.broadcast();
@@ -79,6 +64,12 @@ class TtsEngine {
   /// Tokenizer vocabulary: phoneme character → token ID.
   /// Loaded from assets/tokenizer_vocab.json to enable token-level splitting.
   Map<String, int> _vocab = {};
+
+  // =========================================================================
+  // Playback tracking
+  // =========================================================================
+  /// Total duration of generated audio in seconds (for logging).
+  double _totalDuration = 0;
 
   // =========================================================================
   // Token IDs for smart splitting
@@ -378,7 +369,11 @@ class TtsEngine {
   }
 
   /// Generates audio for a single batch (phonemes or raw text).
-  Future<_AudioChunk?> _generateAudio(String batch, {required bool isPhonemes}) async {
+  /// Returns the PCM data and sample rate, or null on failure.
+  Future<(Int16List pcm, int sampleRate)?> _generateBatch(
+    String batch, {
+    required bool isPhonemes,
+  }) async {
     if (_kokoro == null || _currentVoiceId == null) return null;
     if (batch.trim().isEmpty) return null;
 
@@ -391,27 +386,29 @@ class TtsEngine {
         isPhonemes: isPhonemes,
       );
 
-      return _AudioChunk(
-        pcmData: result.toInt16PCM(),
-        sampleRate: result.sampleRate,
-        duration: result.duration,
-      );
+      return (result.toInt16PCM(), result.sampleRate);
     } catch (e) {
-      debugPrint('[TTS] Error generating audio: $e');
+      debugPrint('[TTS] Error generating batch: $e');
       return null;
     }
   }
 
-  /// Speaks the given text with pre-buffered streaming.
+  /// Speaks the given text using an interleaved generate-play pipeline.
+  /// 
+  /// If [prePhonemes] is provided, phonemization is skipped entirely and the
+  /// pre-computed phonemes are split into batches directly. This is the fast
+  /// path for pages that were pre-phonemized at import time.
   /// 
   /// Pipeline:
-  ///   1. Phonemize all text at once (espeak-ng) or chunk text (fallback)
-  ///   2. Split into optimal batches at sentence boundaries
-  ///   3. Pre-generate audio chunks ahead of playback
-  ///   4. Stream playback with overlap (generate N+1 while playing N)
+  ///   1. Phonemize text (or use prePhonemes), split into batches
+  ///   2. Generate batch 1 → play immediately
+  ///   3. While batch N plays (on SoLoud's native thread), generate batch N+1
+  ///   4. When batch N finishes, play N+1 immediately (near-seamless)
+  ///   5. Repeat until all batches done
   /// 
-  /// Returns the total generated audio duration in seconds.
-  Future<double> speak(String text) async {
+  /// SoLoud plays audio on a native thread so playback continues even while
+  /// ONNX blocks the Dart event loop during generation.
+  Future<double> speak(String text, {String? prePhonemes}) async {
     if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
       throw StateError('TTS engine not ready. Current status: $_status');
     }
@@ -421,132 +418,149 @@ class TtsEngine {
     }
 
     await stop();
-    _audioBuffer.clear();
-    _setStatus(TtsStatus.speaking);
+    _totalDuration = 0;
+    _setStatus(TtsStatus.generating);
 
     try {
-      // Step 1: Phonemize all text and split into optimal batches
-      final (batches, isPhonemes) = _prepareBatches(text);
+      // Step 1: Use pre-phonemized input or phonemize now
+      final List<String> batches;
+      final bool isPhonemes;
+
+      if (prePhonemes != null && prePhonemes.isNotEmpty) {
+        // Fast path: phonemes already computed at import time
+        batches = _splitPhonemesAtBoundaries(prePhonemes);
+        isPhonemes = true;
+        debugPrint('[TTS] Using pre-phonemized input (${prePhonemes.length} chars)');
+      } else {
+        // Slow path: phonemize now
+        final prepared = _prepareBatches(text);
+        batches = prepared.$1;
+        isPhonemes = prepared.$2;
+      }
+
       final totalBatches = batches.length;
-      double totalDuration = 0;
-      int generateIndex = 0;
-      int playIndex = 0;
+      debugPrint('[TTS] $totalBatches batches (phonemes=$isPhonemes)');
 
-      debugPrint('[TTS] Starting playback: $totalBatches batches (phonemes=$isPhonemes), pre-buffering $_preBufferCount');
+      if (totalBatches == 0) {
+        _setStatus(TtsStatus.ready);
+        return 0;
+      }
 
-      // Phase 1: Pre-buffer initial batches before starting playback
-      while (generateIndex < totalBatches && _audioBuffer.length < _preBufferCount) {
+      int sampleRate = 24000;
+
+      // Step 2: Generate batch 1
+      debugPrint('[TTS] Generating batch 1/$totalBatches...');
+      final firstResult = await _generateBatch(batches[0], isPhonemes: isPhonemes);
+      if (_status != TtsStatus.generating || firstResult == null) {
+        _setStatus(TtsStatus.ready);
+        return 0;
+      }
+      sampleRate = firstResult.$2;
+      _totalDuration += firstResult.$1.length / sampleRate;
+
+      // Start playing batch 1 immediately
+      _setStatus(TtsStatus.speaking);
+      debugPrint('[TTS] Playing batch 1/$totalBatches '
+          '(${(firstResult.$1.length / sampleRate).toStringAsFixed(1)}s)');
+
+      // Step 3: Interleaved pipeline -- generate N+1 while playing N
+      // SoLoud plays on a native thread, so audio continues during ONNX calls.
+      var playFuture = _playContinuousAudio(firstResult.$1, sampleRate: sampleRate);
+
+      for (int i = 1; i < totalBatches; i++) {
+        // Check if stopped
+        if (_status != TtsStatus.speaking && _status != TtsStatus.paused) break;
+
+        // Generate next batch (ONNX blocks Dart thread, but SoLoud keeps playing)
+        debugPrint('[TTS] Generating batch ${i + 1}/$totalBatches...');
+        final result = await _generateBatch(batches[i], isPhonemes: isPhonemes);
+
+        if (_status != TtsStatus.speaking && _status != TtsStatus.paused) break;
+
+        // Wait for current audio to finish
+        await playFuture;
+
+        // Pause gate
+        while (_status == TtsStatus.paused) {
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
         if (_status != TtsStatus.speaking) break;
 
-        debugPrint('[TTS] Pre-buffering batch ${generateIndex + 1}/$totalBatches...');
-        final audio = await _generateAudio(batches[generateIndex], isPhonemes: isPhonemes);
-        if (audio != null) {
-          _audioBuffer.addLast(audio);
-          totalDuration += audio.duration;
-        }
-        generateIndex++;
-      }
-
-      debugPrint('[TTS] Pre-buffer complete, ${_audioBuffer.length} batches ready. Starting playback...');
-
-      // Phase 2: Play and generate in overlapping fashion
-      while (playIndex < totalBatches && _status == TtsStatus.speaking) {
-        if (_audioBuffer.isNotEmpty) {
-          final audio = _audioBuffer.removeFirst();
-          playIndex++;
-
-          debugPrint('[TTS] Playing batch $playIndex/$totalBatches (${audio.duration.toStringAsFixed(2)}s), buffer: ${_audioBuffer.length}');
-
-          // Start playback (non-blocking)
-          final playFuture = _playPcmInt16AndWait(audio.pcmData, sampleRate: audio.sampleRate);
-
-          // While audio plays, generate the next batch if needed
-          if (generateIndex < totalBatches && _audioBuffer.length < _preBufferCount) {
-            debugPrint('[TTS] Generating batch ${generateIndex + 1}/$totalBatches while playing...');
-            final nextAudio = await _generateAudio(batches[generateIndex], isPhonemes: isPhonemes);
-            if (nextAudio != null) {
-              _audioBuffer.addLast(nextAudio);
-              totalDuration += nextAudio.duration;
-            }
-            generateIndex++;
-          }
-
-          // Wait for current audio to finish
-          await playFuture;
-          debugPrint('[TTS] Batch $playIndex finished');
-        } else if (generateIndex < totalBatches) {
-          // Buffer empty, generate and play immediately
-          debugPrint('[TTS] Buffer empty, generating batch ${generateIndex + 1}/$totalBatches directly...');
-          final audio = await _generateAudio(batches[generateIndex], isPhonemes: isPhonemes);
-          generateIndex++;
-
-          if (audio != null) {
-            totalDuration += audio.duration;
-            playIndex++;
-            await _playPcmInt16AndWait(audio.pcmData, sampleRate: audio.sampleRate);
-          }
-        } else {
-          break;
+        // Play next batch immediately
+        if (result != null) {
+          sampleRate = result.$2;
+          _totalDuration += result.$1.length / sampleRate;
+          debugPrint('[TTS] Playing batch ${i + 1}/$totalBatches '
+              '(${(result.$1.length / sampleRate).toStringAsFixed(1)}s)');
+          playFuture = _playContinuousAudio(result.$1, sampleRate: sampleRate);
         }
       }
 
-      _audioBuffer.clear();
-      _setStatus(TtsStatus.ready);
-      debugPrint('[TTS] Playback complete. Total duration: ${totalDuration.toStringAsFixed(2)}s');
-      return totalDuration;
+      // Wait for last batch to finish
+      await playFuture;
+
+      if (_status == TtsStatus.speaking) {
+        _setStatus(TtsStatus.ready);
+      }
+      debugPrint('[TTS] Playback complete. Total: ${_totalDuration.toStringAsFixed(2)}s');
+      return _totalDuration;
     } catch (e) {
       debugPrint('[TTS] Error during speak: $e');
-      _audioBuffer.clear();
       _setStatus(TtsStatus.error);
       rethrow;
     }
   }
 
-  /// Plays Int16 PCM audio data through SoLoud and waits for completion.
-  Future<void> _playPcmInt16AndWait(Int16List pcmData, {required int sampleRate}) async {
+  /// Plays a single continuous PCM buffer and waits for it to finish.
+  /// Supports pause/resume via the status field.
+  Future<void> _playContinuousAudio(Int16List pcmData, {required int sampleRate}) async {
     if (_soloud == null) {
       throw StateError('SoLoud not initialized');
     }
 
-    // Create a WAV-like audio buffer in memory for SoLoud
     final wavData = _createWavFromPcm(pcmData, sampleRate: sampleRate);
-    
-    // Calculate expected duration
     final durationSeconds = pcmData.length / sampleRate;
-    debugPrint('[TTS] Created WAV: ${wavData.length} bytes, $sampleRate Hz, ${durationSeconds.toStringAsFixed(2)}s');
-    
-    // Load audio from memory
-    final source = await _soloud!.loadMem('tts_audio.wav', wavData);
-    debugPrint('[TTS] Loaded audio source: ${source.soundHash}');
-    
-    // Play the audio
-    _currentHandle = await _soloud!.play(source);
-    debugPrint('[TTS] Started playback, handle: $_currentHandle');
-    
-    // Wait based on calculated duration + some buffer
-    final waitDuration = Duration(milliseconds: (durationSeconds * 1000).toInt() + 100);
-    debugPrint('[TTS] Waiting ${waitDuration.inMilliseconds}ms for playback...');
-    
-    // Wait for the expected duration, checking periodically if stopped
-    final endTime = DateTime.now().add(waitDuration);
-    while (DateTime.now().isBefore(endTime) && _status == TtsStatus.speaking) {
+
+    // Load and play
+    _currentSource = await _soloud!.loadMem('tts_audio.wav', wavData);
+    _currentHandle = await _soloud!.play(_currentSource!);
+    debugPrint('[TTS] Playing ${durationSeconds.toStringAsFixed(2)}s of continuous audio');
+
+    // Wait for playback, handling pause/resume/stop
+    final waitMs = (durationSeconds * 1000).toInt() + 200;
+    var endTime = DateTime.now().add(Duration(milliseconds: waitMs));
+
+    while (DateTime.now().isBefore(endTime)) {
+      if (_status == TtsStatus.paused) {
+        // Freeze countdown while paused
+        await Future.delayed(const Duration(milliseconds: 100));
+        endTime = endTime.add(const Duration(milliseconds: 100));
+        continue;
+      }
+      if (_status != TtsStatus.speaking) break; // stopped
       await Future.delayed(const Duration(milliseconds: 100));
     }
-    
-    debugPrint('[TTS] Playback wait complete');
-    
+
     // Cleanup
+    _cleanupCurrentAudio();
+  }
+
+  /// Cleans up the current audio source and handle.
+  void _cleanupCurrentAudio() {
     if (_soloud != null) {
       try {
         if (_currentHandle != null) {
           _soloud!.stop(_currentHandle!);
         }
-        await _soloud!.disposeSource(source);
+        if (_currentSource != null) {
+          _soloud!.disposeSource(_currentSource!);
+        }
       } catch (e) {
-        debugPrint('[TTS] Error during cleanup: $e');
+        debugPrint('[TTS] Cleanup error: $e');
       }
     }
     _currentHandle = null;
+    _currentSource = null;
   }
 
   /// Creates a WAV file header and combines with PCM data.
@@ -618,15 +632,11 @@ class TtsEngine {
 
   /// Stops current speech and clears buffers.
   Future<void> stop() async {
-    // Clear the pre-buffer
-    _audioBuffer.clear();
+    _cleanupCurrentAudio();
     
-    if (_currentHandle != null && _soloud != null) {
-      _soloud!.stop(_currentHandle!);
-      _currentHandle = null;
-    }
-    
-    if (_status == TtsStatus.speaking || _status == TtsStatus.paused) {
+    if (_status == TtsStatus.speaking || 
+        _status == TtsStatus.paused ||
+        _status == TtsStatus.generating) {
       _setStatus(TtsStatus.ready);
     }
   }
@@ -652,7 +662,6 @@ class TtsEngine {
   Future<void> dispose() async {
     debugPrint('[TTS] Disposing TTS engine...');
     await stop();
-    _audioBuffer.clear();
     
     // Dispose espeak-ng phonemizer
     if (_useEspeak) {

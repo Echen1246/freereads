@@ -18,6 +18,10 @@ class Book {
   // Optional cover thumbnail path
   final String? coverPath;
 
+  // Whether text extraction has completed for this book.
+  // Books are grayed out in the library until processed.
+  final bool isProcessed;
+
   const Book({
     this.id,
     required this.title,
@@ -30,6 +34,7 @@ class Book {
     this.footerCutoff = 0.92,
     this.isCalibrated = false,
     this.coverPath,
+    this.isProcessed = false,
   });
 
   Book copyWith({
@@ -44,6 +49,7 @@ class Book {
     double? footerCutoff,
     bool? isCalibrated,
     String? coverPath,
+    bool? isProcessed,
   }) {
     return Book(
       id: id ?? this.id,
@@ -57,6 +63,7 @@ class Book {
       footerCutoff: footerCutoff ?? this.footerCutoff,
       isCalibrated: isCalibrated ?? this.isCalibrated,
       coverPath: coverPath ?? this.coverPath,
+      isProcessed: isProcessed ?? this.isProcessed,
     );
   }
 
@@ -73,6 +80,7 @@ class Book {
       'footer_cutoff': footerCutoff,
       'is_calibrated': isCalibrated ? 1 : 0,
       'cover_path': coverPath,
+      'is_processed': isProcessed ? 1 : 0,
     };
   }
 
@@ -91,6 +99,7 @@ class Book {
       footerCutoff: (map['footer_cutoff'] as num?)?.toDouble() ?? 0.92,
       isCalibrated: (map['is_calibrated'] as int?) == 1,
       coverPath: map['cover_path'] as String?,
+      isProcessed: (map['is_processed'] as int?) == 1,
     );
   }
 

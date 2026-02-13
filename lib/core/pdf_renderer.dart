@@ -2,11 +2,13 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfrx/pdfrx.dart';
 
 /// Renders PDF pages to images for OCR processing.
+/// Also supports native text extraction for non-scanned PDFs.
 /// Uses pdfrx with PDFium for high-performance native rendering.
 class PdfRenderer {
   PdfDocument? _document;
@@ -101,6 +103,74 @@ class PdfRenderer {
     }
     final page = _document!.pages[pageIndex];
     return (width: page.width, height: page.height);
+  }
+
+  // ===========================================================================
+  // Native Text Extraction (fast path - skips OCR entirely)
+  // ===========================================================================
+
+  /// Extracts native text from a PDF page as a ready-to-read string.
+  /// Returns null if the page has no embedded text (e.g., scanned/image PDF).
+  /// 
+  /// Uses the PDF's own `fullText` which preserves the document's reading
+  /// order.  Fragments whose vertical center falls outside the header/footer
+  /// cutoffs are dropped before building the result.
+  ///
+  /// This is orders of magnitude faster than OCR:
+  /// - No image rendering, no BMP conversion, no ML Kit processing.
+  Future<String?> extractNativeText(
+    int pageIndex, {
+    double headerCutoff = 0.05,
+    double footerCutoff = 0.95,
+  }) async {
+    if (_document == null) {
+      throw StateError('No document open. Call open() first.');
+    }
+    if (pageIndex < 0 || pageIndex >= pageCount) {
+      throw RangeError('Page index $pageIndex out of range [0, $pageCount)');
+    }
+
+    final page = _document!.pages[pageIndex];
+
+    try {
+      final pageText = await page.loadText();
+
+      // Quick check: is there meaningful text at all?
+      final fullText = pageText.fullText.trim();
+      if (fullText.isEmpty || fullText.length < 10) {
+        debugPrint('[PdfRenderer] Page $pageIndex: no native text '
+            '(${fullText.length} chars), needs OCR');
+        return null;
+      }
+
+      // Filter fragments by header/footer cutoff.
+      // PDF Y-axis: 0 = bottom, pageHeight = top.
+      final pageHeight = page.height;
+      final minY = pageHeight * headerCutoff;   // bottom of header zone
+      final maxY = pageHeight * footerCutoff;    // top of footer zone
+
+      final buf = StringBuffer();
+      for (final fragment in pageText.fragments) {
+        // Fragment center in PDF coords (bottom-up)
+        final centerY = (fragment.bounds.top + fragment.bounds.bottom) / 2;
+        if (centerY < minY || centerY > maxY) continue; // header/footer
+        buf.write(fragment.text);
+      }
+
+      final result = buf.toString().trim();
+      if (result.isEmpty) {
+        debugPrint('[PdfRenderer] Page $pageIndex: all fragments filtered out');
+        return null;
+      }
+
+      debugPrint('[PdfRenderer] Page $pageIndex: extracted ${result.length} '
+          'chars via native text (${pageText.fragments.length} fragments)');
+      return result;
+    } catch (e) {
+      debugPrint('[PdfRenderer] Native text extraction failed for '
+          'page $pageIndex: $e');
+      return null;
+    }
   }
 
   /// Closes the current document and releases resources.

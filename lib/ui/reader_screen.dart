@@ -50,9 +50,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
   
   // Playback state
   bool _isPlaying = false;
+  bool _isGenerating = false;
   bool _isProcessingPage = false;
   int _currentPage = 0;
   String _currentText = '';
+  String? _currentPhonemes;
   double _playbackSpeed = 1.0;
   
   // Calibration preview (for bottom sheet)
@@ -160,13 +162,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
       // Listen to status changes
       _ttsEngine.statusStream.listen((status) {
         if (mounted) {
-          final wasPlaying = _isPlaying;
+          final wasActive = _isPlaying || _isGenerating;
           setState(() {
-            _isPlaying = status == TtsStatus.speaking;
+            _isPlaying = status == TtsStatus.speaking || status == TtsStatus.paused;
+            _isGenerating = status == TtsStatus.generating;
           });
           
           // When TTS finishes (goes back to ready), advance to next page
-          if (wasPlaying && status == TtsStatus.ready && _isPlaying == false) {
+          if (wasActive && status == TtsStatus.ready && !_isPlaying && !_isGenerating) {
             _onPageFinished();
           }
         }
@@ -238,16 +241,25 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() => _isProcessingPage = true);
     
     try {
-      // Render page to temp file for OCR
+      // Fast path: check if text was pre-extracted at import time (DB lookup)
+      final cachedPage = await _database.getPageText(_book.id!, _currentPage);
+      if (cachedPage != null && cachedPage.text.isNotEmpty) {
+        _currentText = cachedPage.text;
+        _currentPhonemes = cachedPage.phonemes;
+        debugPrint('[Reader] Page $_currentPage loaded from DB cache '
+            '(${_currentText.length} chars'
+            '${_currentPhonemes != null ? ', ${_currentPhonemes!.length} phoneme chars' : ', no phonemes'}'
+            ')');
+        setState(() => _isProcessingPage = false);
+        return;
+      }
+
+      // Slow path: OCR for scanned/image PDFs (no pre-extracted text)
+      debugPrint('[Reader] Page $_currentPage not in DB, falling back to OCR');
       final tempPath = await _pdfRenderer.renderPageToTempFile(_currentPage);
-      
-      // Run OCR
       final blocks = await _ocrProcessor.processImageFile(tempPath);
-      
-      // Clean up
       await _ocrProcessor.cleanupTempFile(tempPath);
       
-      // Get dimensions and process text
       final dimensions = _pdfRenderer.getPageDimensions(_currentPage);
       if (dimensions != null) {
         final zone = CalibrationZone(
@@ -255,6 +267,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           footerCutoff: _book.footerCutoff,
         );
         
+        // OCR uses rendered image coordinates (2x scale)
         _currentText = _pageSorter.process(
           blocks,
           zone,
@@ -268,7 +281,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       setState(() => _isProcessingPage = false);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('OCR failed: $e')),
+          SnackBar(content: Text('Text extraction failed: $e')),
         );
       }
     }
@@ -277,7 +290,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Future<void> _togglePlayback() async {
     if (!_ttsInitialized) return;
     
-    if (_isPlaying) {
+    if (_isGenerating) {
+      // Stop generation if user taps while generating
+      await _ttsEngine.stop();
+    } else if (_ttsEngine.status == TtsStatus.speaking) {
       await _ttsEngine.pause();
     } else if (_ttsEngine.status == TtsStatus.paused) {
       await _ttsEngine.resume();
@@ -304,7 +320,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       if (_selectedVoice != null) {
         _ttsEngine.setVoice(_selectedVoice!);
       }
-      await _ttsEngine.speak(_currentText);
+      await _ttsEngine.speak(_currentText, prePhonemes: _currentPhonemes);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -329,6 +345,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _currentPage++;
       _currentText = '';
+      _currentPhonemes = null;
     });
     
     // Load new page image
@@ -351,6 +368,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _currentPage--;
       _currentText = '';
+      _currentPhonemes = null;
     });
     
     // Load new page image
@@ -374,6 +392,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _currentPage = page;
       _currentText = '';
+      _currentPhonemes = null;
     });
     
     // Load new page image
@@ -386,6 +405,23 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _setPlaybackSpeed(double speed) {
     setState(() => _playbackSpeed = speed);
     _ttsEngine.setRate(speed);
+  }
+
+  Widget _buildProgressSection(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    
+    if (_isProcessingPage) {
+      // Extracting text from page
+      return const LinearProgressIndicator();
+    }
+    
+    // Page progress bar (always visible, simple and reliable)
+    return LinearProgressIndicator(
+      value: _totalPages > 0
+          ? ((_currentPage + 1) / _totalPages).clamp(0.0, 1.0)
+          : 0.0,
+      backgroundColor: colorScheme.surface,
+    );
   }
 
   void _showSpeedDialog() {
@@ -673,22 +709,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ),
               ),
 
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
 
-            // Progress indicator
+            // Progress indicator + timer
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: _isProcessingPage
-                  ? const LinearProgressIndicator()
-                  : LinearProgressIndicator(
-                      value: _totalPages > 0
-                          ? ((_currentPage + 1) / _totalPages).clamp(0.0, 1.0)
-                          : 0.0,
-                      backgroundColor: Theme.of(context).colorScheme.surface,
-                    ),
+              child: _buildProgressSection(context),
             ),
 
-            const SizedBox(height: 24),
+            const SizedBox(height: 16),
 
             // Playback controls
             Row(
@@ -722,17 +751,31 @@ class _ReaderScreenState extends State<ReaderScreen> {
                         ? Theme.of(context).colorScheme.primary
                         : Theme.of(context).colorScheme.surface,
                   ),
-                  child: IconButton(
-                    icon: Icon(
-                      _isPlaying ? Icons.pause : Icons.play_arrow,
-                      color: _ttsInitialized ? Colors.black : Colors.grey,
-                    ),
-                    iconSize: 48,
-                    onPressed: _ttsInitialized && !_isProcessingPage
-                        ? _togglePlayback
-                        : null,
-                    padding: const EdgeInsets.all(16),
-                  ),
+                  child: _isGenerating
+                      ? const Padding(
+                          padding: EdgeInsets.all(20),
+                          child: SizedBox(
+                            width: 40,
+                            height: 40,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 3,
+                              color: Colors.black,
+                            ),
+                          ),
+                        )
+                      : IconButton(
+                          icon: Icon(
+                            _ttsEngine.status == TtsStatus.speaking
+                                ? Icons.pause
+                                : Icons.play_arrow,
+                            color: _ttsInitialized ? Colors.black : Colors.grey,
+                          ),
+                          iconSize: 48,
+                          onPressed: _ttsInitialized && !_isProcessingPage
+                              ? _togglePlayback
+                              : null,
+                          padding: const EdgeInsets.all(16),
+                        ),
                 ),
                 
                 const SizedBox(width: 16),
@@ -751,7 +794,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 // Stop button
                 IconButton(
                   icon: const Icon(Icons.stop),
-                  onPressed: _isPlaying ? () => _ttsEngine.stop() : null,
+                  onPressed: (_isPlaying || _isGenerating) ? () => _ttsEngine.stop() : null,
                 ),
               ],
             ),

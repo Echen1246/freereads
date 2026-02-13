@@ -5,9 +5,12 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../core/espeak_phonemizer.dart';
+import '../core/page_sorter.dart';
 import '../core/pdf_renderer.dart';
 import '../data/database.dart';
 import '../data/models/book.dart';
+import '../data/models/page_text.dart';
 import 'reader_screen.dart';
 
 /// Library screen - Kindle-style grid of book covers.
@@ -23,6 +26,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
   List<Book> _books = [];
   bool _isLoading = true;
   bool _isImporting = false;
+
+  /// Book IDs currently being processed (text extraction).
+  final Map<int, double> _processingProgress = {};
 
   @override
   void initState() {
@@ -126,7 +132,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           .replaceAll('-', ' ')
           .replaceAll('_', ' ');
 
-      // Add to database
+      // Add to database (isProcessed defaults to false)
       final book = Book(
         title: title,
         path: newPath,
@@ -135,14 +141,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
         coverPath: coverPath,
       );
 
-      await _database.insertBook(book);
+      final bookId = await _database.insertBook(book);
       await _loadBooks();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Added "$title" to library')),
+          SnackBar(content: Text('Processing "$title"...')),
         );
       }
+
+      // Start text extraction in background (doesn't block UI between pages)
+      _processBook(bookId, newPath, pageCount);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -157,7 +166,94 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
   }
 
+  /// Extracts text from all pages of a native PDF, phonemizes it, and
+  /// stores both text and phonemes in the DB.
+  /// Runs after import; each page extraction is fast for native PDFs.
+  Future<void> _processBook(int bookId, String pdfPath, int pageCount) async {
+    if (_processingProgress.containsKey(bookId)) return; // already processing
+
+    setState(() => _processingProgress[bookId] = 0);
+
+    final renderer = PdfRenderer();
+    final sorter = PageSorter();
+
+    try {
+      await renderer.openFile(pdfPath);
+
+      // Ensure espeak is initialized for phonemization
+      final espeakReady = await EspeakPhonemizer.initialize();
+      if (!espeakReady) {
+        debugPrint('[Library] espeak not available, storing text only');
+      }
+
+      for (int i = 0; i < pageCount; i++) {
+        // Check if already extracted (e.g., partial previous run)
+        if (await _database.hasPageText(bookId, i)) {
+          setState(() => _processingProgress[bookId] = (i + 1) / pageCount);
+          continue;
+        }
+
+        // Try native text extraction (fast path)
+        String? text = await renderer.extractNativeText(i);
+
+        if (text != null && text.isNotEmpty) {
+          text = sorter.reflowText(text);
+        }
+
+        // Pre-phonemize if we have text and espeak is ready
+        String? phonemes;
+        if (text != null && text.isNotEmpty && espeakReady) {
+          phonemes = EspeakPhonemizer.phonemize(text);
+          if (phonemes != null && phonemes.isNotEmpty) {
+            debugPrint('[Library] Page $i: ${text.length} chars → '
+                '${phonemes.length} phoneme chars');
+          }
+        }
+
+        // Store text + phonemes (empty text means reader falls back to OCR)
+        await _database.upsertPageText(PageText(
+          bookId: bookId,
+          pageNumber: i,
+          text: text ?? '',
+          phonemes: phonemes,
+          extractedAt: DateTime.now(),
+        ));
+
+        if (mounted) {
+          setState(() => _processingProgress[bookId] = (i + 1) / pageCount);
+        }
+      }
+
+      // Mark book as processed
+      await _database.markProcessed(bookId);
+      await _loadBooks();
+
+      debugPrint('[Library] Book $bookId processing complete ($pageCount pages)');
+    } catch (e) {
+      debugPrint('[Library] Error processing book $bookId: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Processing failed: $e')),
+        );
+      }
+    } finally {
+      await renderer.close();
+      if (mounted) {
+        setState(() => _processingProgress.remove(bookId));
+      }
+    }
+  }
+
   Future<void> _openBook(Book book) async {
+    if (!book.isProcessed) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Book is still processing...')),
+        );
+      }
+      return;
+    }
+
     await _database.updateLastOpened(book.id!);
 
     if (mounted) {
@@ -348,6 +444,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final book = _books[index];
         return _BookCard(
           book: book,
+          processingProgress: _processingProgress[book.id],
           onTap: () => _openBook(book),
           onLongPress: () => _deleteBook(book),
         );
@@ -358,79 +455,129 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
 class _BookCard extends StatelessWidget {
   final Book book;
+  final double? processingProgress; // null = not processing, 0.0-1.0 = progress
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
   const _BookCard({
     required this.book,
+    this.processingProgress,
     required this.onTap,
     required this.onLongPress,
   });
+
+  bool get _isProcessing => processingProgress != null || !book.isProcessed;
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
       onLongPress: onLongPress,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Cover
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                borderRadius: BorderRadius.circular(8),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.3),
-                    blurRadius: 8,
-                    offset: const Offset(0, 4),
+      child: Opacity(
+        opacity: _isProcessing ? 0.5 : 1.0,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Cover
+            Expanded(
+              child: Stack(
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surface,
+                      borderRadius: BorderRadius.circular(8),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.3),
+                          blurRadius: 8,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: _buildCover(context),
+                    ),
                   ),
+                  // Processing overlay
+                  if (_isProcessing)
+                    Positioned.fill(
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.4),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 32,
+                                height: 32,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 3,
+                                  value: processingProgress,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                processingProgress != null
+                                    ? '${(processingProgress! * 100).toInt()}%'
+                                    : 'Processing...',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: _buildCover(context),
-              ),
             ),
-          ),
-          const SizedBox(height: 8),
-          // Title
-          Text(
-            book.title,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w500,
+            const SizedBox(height: 8),
+            // Title
+            Text(
+              book.title,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w500,
+                  ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 2),
+            // Progress
+            Row(
+              children: [
+                if (book.currentPage > 0 && !_isProcessing) ...[
+                  Icon(
+                    Icons.bookmark,
+                    size: 12,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                  const SizedBox(width: 4),
+                ],
+                Text(
+                  _isProcessing
+                      ? 'Processing...'
+                      : book.currentPage > 0
+                          ? 'Page ${book.currentPage + 1} of ${book.pageCount}'
+                          : '${book.pageCount} pages',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: 0.5),
+                      ),
                 ),
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 2),
-          // Progress
-          Row(
-            children: [
-              if (book.currentPage > 0) ...[
-                Icon(
-                  Icons.bookmark,
-                  size: 12,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-                const SizedBox(width: 4),
               ],
-              Text(
-                book.currentPage > 0
-                    ? 'Page ${book.currentPage + 1} of ${book.pageCount}'
-                    : '${book.pageCount} pages',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context)
-                          .colorScheme
-                          .onSurface
-                          .withValues(alpha: 0.5),
-                    ),
-              ),
-            ],
-          ),
-        ],
+            ),
+          ],
+        ),
       ),
     );
   }
