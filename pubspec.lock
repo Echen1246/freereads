@@ -215,12 +215,11 @@ packages:
     source: hosted
     version: "5.0.0"
   flutter_onnxruntime:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: flutter_onnxruntime
-      sha256: "8e1517462cc829d4cafc49702bf11d8a3946be608ca5907d37bf713eb6490231"
-      url: "https://pub.dev"
-    source: hosted
+      path: "packages/flutter_onnxruntime"
+      relative: true
+    source: path
     version: "1.6.1"
   flutter_plugin_android_lifecycle:
     dependency: transitive

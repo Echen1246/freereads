@@ -45,10 +45,13 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^5.0.0
 
-# Override with local patched version to fix Float32List type casting bug
+# Override with local patched versions
 dependency_overrides:
   kokoro_tts_flutter:
     path: packages/kokoro_tts_flutter
+  # Forked to run ONNX inference on a background thread (fixes device freezing)
+  flutter_onnxruntime:
+    path: packages/flutter_onnxruntime
 
 flutter:
   uses-material-design: true
