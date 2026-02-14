@@ -68,6 +68,10 @@ class TtsEngine {
   /// Whether espeak-ng phonemizer is available (Android only for now)
   bool _useEspeak = false;
 
+  /// Tracks whether speak() is currently executing. stop() awaits this
+  /// so that dispose() is never called while ONNX inference is in-flight.
+  Completer<void>? _speakCompleter;
+
   /// Tokenizer vocabulary: phoneme character → token ID.
   /// Loaded from assets/tokenizer_vocab.json to enable token-level splitting.
   Map<String, int> _vocab = {};
@@ -448,10 +452,19 @@ class TtsEngine {
   /// 
   /// SoLoud plays audio on a native thread so playback continues even while
   /// ONNX blocks the Dart event loop during generation.
+  /// Speaks [text] through the TTS pipeline.
+  ///
+  /// If [sentencePhonemes] is provided (one phoneme string per sentence),
+  /// phonemization is skipped entirely -- this is the fast path used when
+  /// phonemes were pre-computed at book import time.
+  ///
+  /// If only [sentences] is provided (no phonemes), each sentence is
+  /// phonemized at runtime via espeak + lexicon.
   Future<double> speak(
     String text, {
     String? prePhonemes,
     List<String>? sentences,
+    List<String>? sentencePhonemes,
   }) async {
     if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
       throw StateError('TTS engine not ready. Current status: $_status');
@@ -466,6 +479,7 @@ class TtsEngine {
     _currentSentenceIndex = 0;
     _setStatus(TtsStatus.generating);
 
+    _speakCompleter = Completer<void>();
     try {
       // Step 1: Build sentence-to-batch mapping and split into batches
       final List<String> batches;
@@ -473,23 +487,31 @@ class TtsEngine {
       // batchSentenceStart[i] = first sentence index covered by batch i
       final List<int> batchSentenceStart;
 
-      if (sentences != null && sentences.isNotEmpty && _useEspeak) {
-        // Sentence tracking path: phonemize each sentence individually so we
-        // can track which sentences map to which batches. Works regardless of
-        // whether prePhonemes is provided -- the per-sentence espeak calls are
-        // fast (~sub-ms each).
-        final sentencePhonemes = <String>[];
-        for (final s in sentences) {
-          final ph = EspeakPhonemizer.phonemize(s);
-          sentencePhonemes.add(ph ?? s); // fallback to raw text
-        }
-
-        // Pack sentences into batches respecting the token limit
+      if (sentencePhonemes != null &&
+          sentences != null &&
+          sentencePhonemes.length == sentences.length) {
+        // Fast path: pre-computed per-sentence phonemes from import time.
+        // No phonemization needed at all -- just pack into batches.
         final result = _packSentencesIntoBatches(sentencePhonemes);
         batches = result.$1;
         batchSentenceStart = result.$2;
         isPhonemes = true;
-        debugPrint('[TTS] ${sentences.length} sentences -> ${batches.length} batches');
+        debugPrint('[TTS] ${sentences.length} sentences -> ${batches.length} batches '
+            '(pre-computed phonemes, zero runtime phonemization)');
+      } else if (sentences != null && sentences.isNotEmpty && _useEspeak) {
+        // Sentence tracking path: phonemize each sentence at runtime.
+        final computed = <String>[];
+        for (final s in sentences) {
+          final ph = EspeakPhonemizer.phonemize(s);
+          computed.add(ph ?? s);
+        }
+
+        final result = _packSentencesIntoBatches(computed);
+        batches = result.$1;
+        batchSentenceStart = result.$2;
+        isPhonemes = true;
+        debugPrint('[TTS] ${sentences.length} sentences -> ${batches.length} batches '
+            '(runtime phonemization)');
       } else if (prePhonemes != null && prePhonemes.isNotEmpty) {
         // Pre-phonemized but no sentence list -- just split by boundaries
         batches = _splitPhonemesAtBoundaries(prePhonemes);
@@ -576,6 +598,11 @@ class TtsEngine {
       debugPrint('[TTS] Error during speak: $e');
       _setStatus(TtsStatus.error);
       rethrow;
+    } finally {
+      // Signal that speak() has fully exited (no more ONNX calls in flight).
+      if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
+        _speakCompleter!.complete();
+      }
     }
   }
 
@@ -773,6 +800,13 @@ class TtsEngine {
         _status == TtsStatus.generating) {
       _setStatus(TtsStatus.ready);
     }
+
+    // Wait for speak() to fully exit so no ONNX calls are in-flight
+    // before dispose() destroys the session.
+    if (_speakCompleter != null && !_speakCompleter!.isCompleted) {
+      await _speakCompleter!.future;
+    }
+    _speakCompleter = null;
   }
 
   /// Sets the speech rate (0.5 = half speed, 2.0 = double speed).

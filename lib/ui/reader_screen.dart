@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -30,6 +31,39 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   final OcrProcessor _ocrProcessor = OcrProcessor();
   final PageSorter _pageSorter = PageSorter();
   final TtsEngine _ttsEngine = TtsEngine();
+
+  /// Converts a Kokoro voice ID (e.g. "bm_lewis") into a display name
+  /// with a flag emoji (e.g. "British Lewis").
+  static String _voiceDisplayName(String voiceId) {
+    // Format: {region}{gender}_{name}
+    // a = American, b = British
+    // f = Female, m = Male
+    final parts = voiceId.split('_');
+    if (parts.length < 2) return voiceId;
+
+    final prefix = parts[0]; // e.g. "bm", "af"
+    final rawName = parts.sublist(1).join(' '); // e.g. "lewis", "sky"
+    final name = rawName[0].toUpperCase() + rawName.substring(1);
+
+    String flag;
+    String gender;
+    if (prefix.isNotEmpty) {
+      switch (prefix[0]) {
+        case 'a':
+          flag = '\u{1F1FA}\u{1F1F8}'; // US flag
+        case 'b':
+          flag = '\u{1F1EC}\u{1F1E7}'; // UK flag
+        default:
+          flag = '';
+      }
+      gender = prefix.length > 1 && prefix[1] == 'f' ? 'Female' : 'Male';
+    } else {
+      flag = '';
+      gender = '';
+    }
+
+    return '$flag $name ($gender)'.trim();
+  }
 
   late Book _book;
   
@@ -63,6 +97,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   // Continuous playback: maps each sentence index to its source page number
   List<int> _sentencePageMap = [];
   final ScrollController _sentencePanelScrollController = ScrollController();
+  final GlobalKey _activeSentenceKey = GlobalKey();
   
   // Calibration preview (for bottom sheet)
   PdfImage? _calibrationPageImage;
@@ -351,14 +386,40 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     // cross-page playback. This eliminates the gap/hitch at page boundaries.
     final allPages = await _database.getAllPages(_book.id!);
     final remainingSentences = <String>[];
+    final remainingPhonemes = <String>[];
     final remainingPageMap = <int>[];
+    bool hasPrecomputedPhonemes = true;
 
     for (final page in allPages) {
       if (page.pageNumber < _currentPage) continue;
       if (page.text.isEmpty) continue;
       final sentences = TtsEngine.splitSentences(page.text);
-      for (final s in sentences) {
-        remainingSentences.add(s);
+
+      // Try to decode pre-computed per-sentence phonemes
+      List<String>? pagePhonemes;
+      if (page.phonemes != null && page.phonemes!.isNotEmpty) {
+        try {
+          pagePhonemes =
+              (jsonDecode(page.phonemes!) as List).cast<String>();
+        } catch (_) {
+          // Old format (single blob) or corrupt -- fall back to runtime
+          pagePhonemes = null;
+        }
+      }
+
+      // If sentence count doesn't match phoneme count, discard (stale data)
+      if (pagePhonemes != null && pagePhonemes.length != sentences.length) {
+        debugPrint('[Reader] Page ${page.pageNumber}: sentence/phoneme count '
+            'mismatch (${sentences.length} vs ${pagePhonemes.length}), '
+            'will re-phonemize');
+        pagePhonemes = null;
+      }
+
+      if (pagePhonemes == null) hasPrecomputedPhonemes = false;
+
+      for (int j = 0; j < sentences.length; j++) {
+        remainingSentences.add(sentences[j]);
+        remainingPhonemes.add(pagePhonemes != null ? pagePhonemes[j] : '');
         remainingPageMap.add(page.pageNumber);
       }
     }
@@ -377,12 +438,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       final sentences = TtsEngine.splitSentences(_currentText);
       for (final s in sentences) {
         remainingSentences.add(s);
+        remainingPhonemes.add('');
         remainingPageMap.add(_currentPage);
       }
+      hasPrecomputedPhonemes = false;
     }
 
     debugPrint('[Reader] Continuous playback: ${remainingSentences.length} sentences '
-        'across pages $_currentPage..${remainingPageMap.isNotEmpty ? remainingPageMap.last : _currentPage}');
+        'across pages $_currentPage..${remainingPageMap.isNotEmpty ? remainingPageMap.last : _currentPage}'
+        ' (precomputed=${hasPrecomputedPhonemes ? "yes" : "no"})');
 
     setState(() {
       _sentences = remainingSentences;
@@ -402,6 +466,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       await _ttsEngine.speak(
         remainingSentences.join(' '),
         sentences: remainingSentences,
+        sentencePhonemes: hasPrecomputedPhonemes ? remainingPhonemes : null,
       );
     } catch (e) {
       if (mounted) {
@@ -497,26 +562,22 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     _ttsEngine.setRate(speed);
   }
 
-  /// Scrolls the sentence panel to keep the active sentence visible.
+  /// Scrolls the sentence panel to keep the active sentence centered.
+  /// Uses the actual rendered widget position via [Scrollable.ensureVisible]
+  /// so it stays accurate regardless of sentence length variation.
   void _scrollToActiveSentence() {
-    if (!_sentencePanelScrollController.hasClients) return;
-    if (_sentences.isEmpty) return;
-
-    // Estimate: position the active sentence roughly 1/3 from the top.
-    // With individual sentence items averaging ~56px each, this gives a
-    // reasonable approximation.
-    const estimatedItemHeight = 56.0;
-    final targetOffset = _activeSentenceIndex * estimatedItemHeight -
-        (_sentencePanelScrollController.position.viewportDimension / 3);
-
-    _sentencePanelScrollController.animateTo(
-      targetOffset.clamp(
-        0.0,
-        _sentencePanelScrollController.position.maxScrollExtent,
-      ),
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeOut,
-    );
+    // Wait one frame so the ListView has built the active item with its key.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final keyContext = _activeSentenceKey.currentContext;
+      if (keyContext != null) {
+        Scrollable.ensureVisible(
+          keyContext,
+          alignment: 0.4, // place active sentence ~40% from top (visual center)
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
   /// Builds the sentence display panel (Spotify-style captions).
@@ -578,6 +639,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                     ),
                   ),
                 Padding(
+                  key: isActive ? _activeSentenceKey : null,
                   padding: const EdgeInsets.symmetric(vertical: 4),
                   child: Text(
                     _sentences[i],
@@ -735,8 +797,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                 itemCount: _availableVoices.length,
                 itemBuilder: (context, index) {
                   final voice = _availableVoices[index];
+                  final displayName = _voiceDisplayName(voice);
                   return ListTile(
-                    title: Text(voice),
+                    title: Text(displayName),
                     trailing: _selectedVoice == voice
                         ? Icon(Icons.check, color: Theme.of(context).colorScheme.primary)
                         : null,
@@ -789,11 +852,12 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     // in the top bar is the intended way to exit the reader.
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
+      onPopInvokedWithResult: (didPop, _) async {
         if (!didPop) {
-          // Stop TTS and navigate back manually
-          _ttsEngine.stop();
-          Navigator.of(context).pop();
+          // Fully stop TTS (waits for any in-flight ONNX to finish)
+          // before navigating back, preventing native crashes.
+          await _ttsEngine.stop();
+          if (mounted) Navigator.of(context).pop();
         }
       },
       child: Scaffold(
@@ -807,7 +871,10 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                 children: [
                   IconButton(
                     icon: const Icon(Icons.keyboard_arrow_down),
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: () async {
+                      await _ttsEngine.stop();
+                      if (mounted) Navigator.of(context).pop();
+                    },
                     iconSize: 32,
                   ),
                   const Spacer(),
@@ -826,7 +893,15 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                           ? Icons.subtitles
                           : Icons.subtitles_off_outlined,
                     ),
-                    onPressed: () => setState(() => _showCaptions = !_showCaptions),
+                    onPressed: () {
+                      setState(() => _showCaptions = !_showCaptions);
+                      if (_showCaptions) {
+                        // Scroll to the active sentence after the panel builds
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          _scrollToActiveSentence();
+                        });
+                      }
+                    },
                     tooltip: _showCaptions ? 'Hide captions' : 'Show captions',
                   ),
                   IconButton(
@@ -911,7 +986,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                     ),
                     const SizedBox(width: 8),
                     Text(
-                      _selectedVoice ?? 'Select voice',
+                      _selectedVoice != null
+                          ? _voiceDisplayName(_selectedVoice!)
+                          : 'Select voice',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: Theme.of(context).colorScheme.primary,
                       ),

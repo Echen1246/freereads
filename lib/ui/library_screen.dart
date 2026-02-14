@@ -1,13 +1,16 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/espeak_phonemizer.dart';
 import '../core/page_sorter.dart';
 import '../core/pdf_renderer.dart';
+import '../core/tts_engine.dart';
 import '../data/database.dart';
 import '../data/models/book.dart';
 import '../data/models/page_text.dart';
@@ -30,10 +33,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
   /// Book IDs currently being processed (text extraction).
   final Map<int, double> _processingProgress = {};
 
+  static const _onboardingKey = 'has_seen_onboarding';
+
   @override
   void initState() {
     super.initState();
     _loadBooks();
+    _checkFirstLaunch();
+  }
+
+  Future<void> _checkFirstLaunch() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_onboardingKey) != true) {
+      if (mounted) {
+        await _showOnboarding();
+        await prefs.setBool(_onboardingKey, true);
+      }
+    }
   }
 
   Future<void> _loadBooks() async {
@@ -200,22 +216,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
           text = sorter.reflowText(text);
         }
 
-        // Pre-phonemize if we have text and espeak is ready
-        String? phonemes;
+        // Pre-phonemize per sentence so playback can skip phonemization
+        // entirely and still do accurate sentence-to-batch tracking.
+        String? phonemesJson;
         if (text != null && text.isNotEmpty && espeakReady) {
-          phonemes = EspeakPhonemizer.phonemize(text);
-          if (phonemes != null && phonemes.isNotEmpty) {
-            debugPrint('[Library] Page $i: ${text.length} chars → '
-                '${phonemes.length} phoneme chars');
+          final sentences = TtsEngine.splitSentences(text);
+          final sentencePhonemes = <String>[];
+          for (final s in sentences) {
+            final ph = EspeakPhonemizer.phonemize(s);
+            sentencePhonemes.add(ph ?? s);
           }
+          phonemesJson = jsonEncode(sentencePhonemes);
+          debugPrint('[Library] Page $i: ${sentences.length} sentences, '
+              '${text.length} chars');
         }
 
-        // Store text + phonemes (empty text means reader falls back to OCR)
+        // Store text + per-sentence phonemes JSON
         await _database.upsertPageText(PageText(
           bookId: bookId,
           pageNumber: i,
           text: text ?? '',
-          phonemes: phonemes,
+          phonemes: phonemesJson,
           extractedAt: DateTime.now(),
         ));
 
@@ -322,6 +343,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
   }
 
+  /// Multi-slide onboarding dialog explaining app features.
+  Future<void> _showOnboarding() async {
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const _OnboardingDialog(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -332,24 +362,42 @@ class _LibraryScreenState extends State<LibraryScreen> {
             // Header
             Padding(
               padding: const EdgeInsets.fromLTRB(24, 32, 24, 24),
-              child: Column(
+              child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    'FreeReads',
-                    style: Theme.of(context).textTheme.headlineLarge?.copyWith(
-                          letterSpacing: -1.5,
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'FreeReads',
+                          style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+                                letterSpacing: -1.5,
+                              ),
                         ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Your Library',
+                          style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurface
+                                    .withValues(alpha: 0.6),
+                              ),
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Your Library',
-                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSurface
-                              .withValues(alpha: 0.6),
-                        ),
+                  IconButton(
+                    icon: Icon(
+                      Icons.help_outline,
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurface
+                          .withValues(alpha: 0.5),
+                    ),
+                    onPressed: _showOnboarding,
+                    tooltip: 'How it works',
                   ),
                 ],
               ),
@@ -631,4 +679,189 @@ class _BookCard extends StatelessWidget {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding dialog
+// ---------------------------------------------------------------------------
+
+class _OnboardingDialog extends StatefulWidget {
+  const _OnboardingDialog();
+
+  @override
+  State<_OnboardingDialog> createState() => _OnboardingDialogState();
+}
+
+class _OnboardingDialogState extends State<_OnboardingDialog> {
+  final PageController _pageController = PageController();
+  int _currentPage = 0;
+
+  static const _slides = <_OnboardingSlide>[
+    _OnboardingSlide(
+      icon: Icons.menu_book_rounded,
+      title: 'Welcome to FreeReads',
+      body: 'Turn any PDF textbook into a human-quality audiobook. '
+          'Everything runs on your device -- no internet, no accounts, '
+          'no subscriptions.',
+    ),
+    _OnboardingSlide(
+      icon: Icons.add_circle_outline,
+      title: 'Import a Book',
+      body: 'Tap "Add Book" to import a PDF. FreeReads will extract the '
+          'text and prepare pronunciations automatically. The book will '
+          'be grayed out until processing finishes.',
+    ),
+    _OnboardingSlide(
+      icon: Icons.record_voice_over,
+      title: 'Choose a Voice',
+      body: 'Pick from several American and British voices, male or female. '
+          'Tap the voice name at the bottom of the reader to switch anytime.',
+    ),
+    _OnboardingSlide(
+      icon: Icons.subtitles,
+      title: 'Live Captions',
+      body: 'Follow along with sentence-by-sentence captions while '
+          'listening. Toggle them on or off with the subtitles button '
+          'in the top-right corner of the reader.',
+    ),
+    _OnboardingSlide(
+      icon: Icons.tune,
+      title: 'Calibrate Pages',
+      body: 'If the reader picks up headers or page numbers, tap the '
+          'tune icon to adjust header/footer cutoff sliders so only '
+          'the main text is read aloud.',
+    ),
+  ];
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  void _next() {
+    if (_currentPage < _slides.length - 1) {
+      _pageController.nextPage(
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeInOut,
+      );
+    } else {
+      Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              height: 280,
+              child: PageView.builder(
+                controller: _pageController,
+                itemCount: _slides.length,
+                onPageChanged: (i) => setState(() => _currentPage = i),
+                itemBuilder: (context, index) {
+                  final slide = _slides[index];
+                  return Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Container(
+                        width: 64,
+                        height: 64,
+                        decoration: BoxDecoration(
+                          color: colorScheme.primary.withValues(alpha: 0.1),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          slide.icon,
+                          size: 32,
+                          color: colorScheme.primary,
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      Text(
+                        slide.title,
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        slide.body,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: colorScheme.onSurface.withValues(alpha: 0.7),
+                              height: 1.5,
+                            ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 16),
+            // Page dots
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: List.generate(_slides.length, (i) {
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  margin: const EdgeInsets.symmetric(horizontal: 4),
+                  width: _currentPage == i ? 24 : 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: _currentPage == i
+                        ? colorScheme.primary
+                        : colorScheme.onSurface.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                );
+              }),
+            ),
+            const SizedBox(height: 24),
+            // Buttons
+            Row(
+              children: [
+                if (_currentPage > 0)
+                  TextButton(
+                    onPressed: () => _pageController.previousPage(
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeInOut,
+                    ),
+                    child: const Text('Back'),
+                  ),
+                const Spacer(),
+                FilledButton(
+                  onPressed: _next,
+                  child: Text(
+                    _currentPage < _slides.length - 1 ? 'Next' : 'Get Started',
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _OnboardingSlide {
+  final IconData icon;
+  final String title;
+  final String body;
+
+  const _OnboardingSlide({
+    required this.icon,
+    required this.title,
+    required this.body,
+  });
 }
