@@ -343,6 +343,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
   }
 
+  /// FAQ bottom sheet with expandable sections.
+  void _showFaq() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) => const _FaqSheet(),
+    );
+  }
+
   /// Multi-slide onboarding dialog explaining app features.
   Future<void> _showOnboarding() async {
     await showDialog(
@@ -370,7 +383,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'FreeReads',
+                          'Murmur',
                           style: Theme.of(context).textTheme.headlineLarge?.copyWith(
                                 letterSpacing: -1.5,
                               ),
@@ -386,6 +399,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
                               ),
                         ),
                       ],
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _showFaq,
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: const Size(40, 40),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: Text(
+                      'FAQ',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.5,
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: 0.5),
+                      ),
                     ),
                   ),
                   IconButton(
@@ -699,7 +732,7 @@ class _OnboardingDialogState extends State<_OnboardingDialog> {
   static const _slides = <_OnboardingSlide>[
     _OnboardingSlide(
       icon: Icons.menu_book_rounded,
-      title: 'Welcome to FreeReads',
+      title: 'Welcome to Murmur',
       body: 'Turn any PDF textbook into a human-quality audiobook. '
           'Everything runs on your device -- no internet, no accounts, '
           'no subscriptions.',
@@ -707,7 +740,7 @@ class _OnboardingDialogState extends State<_OnboardingDialog> {
     _OnboardingSlide(
       icon: Icons.add_circle_outline,
       title: 'Import a Book',
-      body: 'Tap "Add Book" to import a PDF. FreeReads will extract the '
+      body: 'Tap "Add Book" to import a PDF. Murmur will extract the '
           'text and prepare pronunciations automatically. The book will '
           'be grayed out until processing finishes.',
     ),
@@ -864,4 +897,245 @@ class _OnboardingSlide {
     required this.title,
     required this.body,
   });
+}
+
+// ---------------------------------------------------------------------------
+// FAQ bottom sheet
+// ---------------------------------------------------------------------------
+
+class _FaqSheet extends StatelessWidget {
+  const _FaqSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return DraggableScrollableSheet(
+      initialChildSize: 0.75,
+      minChildSize: 0.4,
+      maxChildSize: 0.92,
+      expand: false,
+      builder: (context, scrollController) {
+        return Column(
+          children: [
+            const SizedBox(height: 8),
+            // Handle
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: colorScheme.onSurface.withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'FAQ',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListView(
+                controller: scrollController,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
+                children: [
+                  _buildFaqTile(
+                    context,
+                    question: 'How does Murmur work?',
+                    answer: 'Murmur extracts text from your PDFs and converts '
+                        'it to speech using a neural text-to-speech model '
+                        '(Kokoro) that runs entirely on your phone. When you '
+                        'import a book, Murmur processes every page -- '
+                        'extracting text and preparing pronunciations -- so '
+                        'playback starts instantly with no buffering.',
+                  ),
+                  _buildFaqTile(
+                    context,
+                    question: 'Where do I get PDFs?',
+                    answer: 'Murmur reads any PDF on your device. Some places '
+                        'people find ebooks:\n\n'
+                        'Internet Archive (archive.org) -- free public domain '
+                        'books\n'
+                        'Project Gutenberg -- classic literature, fully legal\n'
+                        'Anna\'s Archive -- search engine for books\n'
+                        'Google -- search "[book title] PDF"\n'
+                        'Your local library -- many offer digital lending\n\n'
+                        'Please respect copyright laws in your jurisdiction.',
+                  ),
+                  _buildFaqTile(
+                    context,
+                    question: 'Why does the voice sound weird on some words?',
+                    answer: 'Text-to-speech isn\'t perfect, especially with '
+                        'names, technical terms, and unusual words. Murmur '
+                        'uses a large pronunciation dictionary, but edge '
+                        'cases remain. This is a work in progress -- feel '
+                        'free to reach out with feedback.',
+                  ),
+                  _buildFaqTile(
+                    context,
+                    question: 'Does this use the internet?',
+                    answer: 'No. After installation, Murmur is fully offline. '
+                        'The TTS model, pronunciation data, and all processing '
+                        'run on your device. Nothing is uploaded or downloaded.',
+                  ),
+                  const SizedBox(height: 16),
+                  Divider(color: colorScheme.outline.withValues(alpha: 0.15)),
+                  const SizedBox(height: 16),
+                  // Privacy
+                  Text(
+                    'Privacy',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Murmur runs entirely on your device. We don\'t collect, '
+                    'store, or transmit any data. Your PDFs never leave your '
+                    'phone. No accounts, no analytics, no tracking.',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onSurface.withValues(alpha: 0.7),
+                          height: 1.5,
+                        ),
+                  ),
+                  const SizedBox(height: 20),
+                  // Terms
+                  Text(
+                    'Terms',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Murmur is a tool for converting PDFs to audio. You\'re '
+                    'responsible for ensuring you have the right to use any '
+                    'content you import. We don\'t host, distribute, or '
+                    'provide access to copyrighted material.',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onSurface.withValues(alpha: 0.7),
+                          height: 1.5,
+                        ),
+                  ),
+                  const SizedBox(height: 20),
+                  // Acknowledgments
+                  Text(
+                    'Acknowledgments',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Murmur uses the following open source projects:',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onSurface.withValues(alpha: 0.7),
+                          height: 1.5,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  _buildLicenseRow(context, 'Kokoro TTS', 'MIT License'),
+                  _buildLicenseRow(context, 'Misaki Phonemizer', 'MIT License'),
+                  _buildLicenseRow(context, 'ONNX Runtime', 'MIT License'),
+                  _buildLicenseRow(context, 'espeak-ng', 'GPL-3.0 License'),
+                  _buildLicenseRow(context, 'Flutter SoLoud', 'MIT License'),
+                  const SizedBox(height: 20),
+                  // Contact
+                  Text(
+                    'Contact',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Bug reports, feedback, or just want to say hi? '
+                    'Reach out at:',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onSurface.withValues(alpha: 0.7),
+                          height: 1.5,
+                        ),
+                  ),
+                  const SizedBox(height: 4),
+                  SelectableText(
+                    'mymelohealth@gmail.com',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.primary,
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  static Widget _buildFaqTile(
+    BuildContext context, {
+    required String question,
+    required String answer,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(bottom: 12),
+        title: Text(
+          question,
+          style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+        ),
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              answer,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: colorScheme.onSurface.withValues(alpha: 0.7),
+                    height: 1.5,
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static Widget _buildLicenseRow(
+    BuildContext context,
+    String project,
+    String license,
+  ) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Icon(Icons.circle, size: 6,
+              color: colorScheme.onSurface.withValues(alpha: 0.4)),
+          const SizedBox(width: 8),
+          Text(
+            project,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w500,
+                ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '($license)',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurface.withValues(alpha: 0.5),
+                ),
+          ),
+        ],
+      ),
+    );
+  }
 }

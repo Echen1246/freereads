@@ -28,7 +28,7 @@ class _HomeScreenState extends State<HomeScreen> {
               
               // App title
               Text(
-                'FreeReads',
+                'Murmur',
                 style: Theme.of(context).textTheme.headlineLarge?.copyWith(
                   letterSpacing: -1.5,
                 ),
@@ -159,9 +159,9 @@ class _HomeScreenState extends State<HomeScreen> {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => const PlayerScreen(
-          text: 'Hello! Welcome to FreeReads. This is a test of the Kokoro text-to-speech engine. '
+          text: 'Hello! Welcome to Murmur. This is a test of the Kokoro text-to-speech engine. '
               'If you can hear this message, the TTS pipeline is working correctly. '
-              'FreeReads converts your PDF textbooks into human-quality audio, '
+              'Murmur converts your PDF textbooks into human-quality audio, '
               'all running locally on your device with no cloud dependencies.',
           title: 'TTS Test',
         ),
