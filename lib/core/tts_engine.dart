@@ -54,6 +54,13 @@ class TtsEngine {
   final _statusController = StreamController<TtsStatus>.broadcast();
   Stream<TtsStatus> get statusStream => _statusController.stream;
   TtsStatus get status => _status;
+
+  /// Emits the index of the sentence currently being spoken (0-based).
+  /// Used by the UI to highlight the active sentence.
+  final _sentenceIndexController = StreamController<int>.broadcast();
+  Stream<int> get sentenceIndexStream => _sentenceIndexController.stream;
+  int _currentSentenceIndex = 0;
+  int get currentSentenceIndex => _currentSentenceIndex;
   
   /// Available voice IDs after initialization
   List<String> get availableVoices => _kokoro?.getVoices() ?? [];
@@ -393,22 +400,49 @@ class TtsEngine {
     }
   }
 
+  /// Splits text into sentences at sentence-ending punctuation (.!?).
+  /// Returns a list of sentences preserving original whitespace and punctuation.
+  static List<String> splitSentences(String text) {
+    final sentences = <String>[];
+    final pattern = RegExp(r'(?<=[.!?])\s+');
+    final parts = text.split(pattern);
+    for (final part in parts) {
+      final trimmed = part.trim();
+      if (trimmed.isNotEmpty) {
+        sentences.add(trimmed);
+      }
+    }
+    // If no sentence-ending punctuation was found, treat the whole text as one sentence
+    if (sentences.isEmpty && text.trim().isNotEmpty) {
+      sentences.add(text.trim());
+    }
+    return sentences;
+  }
+
   /// Speaks the given text using an interleaved generate-play pipeline.
   /// 
   /// If [prePhonemes] is provided, phonemization is skipped entirely and the
   /// pre-computed phonemes are split into batches directly. This is the fast
   /// path for pages that were pre-phonemized at import time.
   /// 
+  /// [sentences] is an optional pre-split sentence list for the UI sentence
+  /// highlighter. If provided, the engine emits sentence indices via
+  /// [sentenceIndexStream] as each batch starts playing.
+  /// 
   /// Pipeline:
   ///   1. Phonemize text (or use prePhonemes), split into batches
-  ///   2. Generate batch 1 → play immediately
+  ///   2. Generate batch 1 -> play immediately
   ///   3. While batch N plays (on SoLoud's native thread), generate batch N+1
   ///   4. When batch N finishes, play N+1 immediately (near-seamless)
   ///   5. Repeat until all batches done
   /// 
   /// SoLoud plays audio on a native thread so playback continues even while
   /// ONNX blocks the Dart event loop during generation.
-  Future<double> speak(String text, {String? prePhonemes}) async {
+  Future<double> speak(
+    String text, {
+    String? prePhonemes,
+    List<String>? sentences,
+  }) async {
     if (_status != TtsStatus.ready && _status != TtsStatus.paused) {
       throw StateError('TTS engine not ready. Current status: $_status');
     }
@@ -419,22 +453,42 @@ class TtsEngine {
 
     await stop();
     _totalDuration = 0;
+    _currentSentenceIndex = 0;
     _setStatus(TtsStatus.generating);
 
     try {
-      // Step 1: Use pre-phonemized input or phonemize now
+      // Step 1: Build sentence-to-batch mapping and split into batches
       final List<String> batches;
       final bool isPhonemes;
+      // batchSentenceStart[i] = first sentence index covered by batch i
+      final List<int> batchSentenceStart;
 
-      if (prePhonemes != null && prePhonemes.isNotEmpty) {
-        // Fast path: phonemes already computed at import time
+      if (prePhonemes != null && prePhonemes.isNotEmpty && sentences != null) {
+        // Fast path: phonemize each sentence individually so we can track
+        // which sentences map to which batches.
+        final sentencePhonemes = <String>[];
+        for (final s in sentences) {
+          final ph = EspeakPhonemizer.phonemize(s);
+          sentencePhonemes.add(ph ?? s); // fallback to raw text
+        }
+
+        // Pack sentences into batches respecting the token limit
+        final result = _packSentencesIntoBatches(sentencePhonemes);
+        batches = result.$1;
+        batchSentenceStart = result.$2;
+        isPhonemes = true;
+        debugPrint('[TTS] ${sentences.length} sentences -> ${batches.length} batches');
+      } else if (prePhonemes != null && prePhonemes.isNotEmpty) {
+        // Pre-phonemized but no sentence list -- just split by boundaries
         batches = _splitPhonemesAtBoundaries(prePhonemes);
+        batchSentenceStart = List.generate(batches.length, (i) => i);
         isPhonemes = true;
         debugPrint('[TTS] Using pre-phonemized input (${prePhonemes.length} chars)');
       } else {
         // Slow path: phonemize now
         final prepared = _prepareBatches(text);
         batches = prepared.$1;
+        batchSentenceStart = List.generate(batches.length, (i) => i);
         isPhonemes = prepared.$2;
       }
 
@@ -460,6 +514,7 @@ class TtsEngine {
 
       // Start playing batch 1 immediately
       _setStatus(TtsStatus.speaking);
+      _emitSentenceIndex(batchSentenceStart, 0);
       debugPrint('[TTS] Playing batch 1/$totalBatches '
           '(${(firstResult.$1.length / sampleRate).toStringAsFixed(1)}s)');
 
@@ -490,6 +545,7 @@ class TtsEngine {
         if (result != null) {
           sampleRate = result.$2;
           _totalDuration += result.$1.length / sampleRate;
+          _emitSentenceIndex(batchSentenceStart, i);
           debugPrint('[TTS] Playing batch ${i + 1}/$totalBatches '
               '(${(result.$1.length / sampleRate).toStringAsFixed(1)}s)');
           playFuture = _playContinuousAudio(result.$1, sampleRate: sampleRate);
@@ -509,6 +565,72 @@ class TtsEngine {
       _setStatus(TtsStatus.error);
       rethrow;
     }
+  }
+
+  /// Emits the sentence index for a given batch.
+  void _emitSentenceIndex(List<int> batchSentenceStart, int batchIndex) {
+    if (batchIndex < batchSentenceStart.length) {
+      _currentSentenceIndex = batchSentenceStart[batchIndex];
+      _sentenceIndexController.add(_currentSentenceIndex);
+    }
+  }
+
+  /// Packs pre-phonemized sentences into batches that fit within the token limit.
+  /// Returns (batches, batchSentenceStart) where batchSentenceStart[i] is the
+  /// first sentence index in batch i.
+  (List<String>, List<int>) _packSentencesIntoBatches(List<String> sentencePhonemes) {
+    final batches = <String>[];
+    final batchSentenceStart = <int>[];
+    
+    var currentBatch = StringBuffer();
+    int currentTokens = 0;
+    int currentBatchFirstSentence = 0;
+    bool batchStarted = false;
+
+    for (int si = 0; si < sentencePhonemes.length; si++) {
+      final ph = sentencePhonemes[si];
+      
+      // Count tokens in this sentence
+      int sentenceTokens = 0;
+      for (int c = 0; c < ph.length; c++) {
+        if (_vocab.containsKey(ph[c])) sentenceTokens++;
+      }
+
+      // Would adding this sentence exceed the limit?
+      if (batchStarted && currentTokens + sentenceTokens > _maxTokensPerBatch) {
+        // Flush current batch
+        final batchStr = currentBatch.toString().trim();
+        if (batchStr.isNotEmpty) {
+          batches.add(batchStr);
+          batchSentenceStart.add(currentBatchFirstSentence);
+        }
+        // Start new batch with this sentence
+        currentBatch = StringBuffer(ph);
+        currentTokens = sentenceTokens;
+        currentBatchFirstSentence = si;
+        batchStarted = true;
+      } else {
+        // Add to current batch
+        if (batchStarted && currentBatch.isNotEmpty) {
+          currentBatch.write(' ');
+        }
+        currentBatch.write(ph);
+        currentTokens += sentenceTokens;
+        if (!batchStarted) {
+          currentBatchFirstSentence = si;
+          batchStarted = true;
+        }
+      }
+    }
+
+    // Flush remaining
+    final remaining = currentBatch.toString().trim();
+    if (remaining.isNotEmpty) {
+      batches.add(remaining);
+      batchSentenceStart.add(currentBatchFirstSentence);
+    }
+
+    return (batches, batchSentenceStart);
   }
 
   /// Plays a single continuous PCM buffer and waits for it to finish.
@@ -684,6 +806,7 @@ class TtsEngine {
     _soloud = null;
     
     _status = TtsStatus.uninitialized;
+    await _sentenceIndexController.close();
     await _statusController.close();
     debugPrint('[TTS] TTS engine disposed');
   }

@@ -24,7 +24,7 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver {
   final AppDatabase _database = AppDatabase();
   final PdfRenderer _pdfRenderer = PdfRenderer();
   final OcrProcessor _ocrProcessor = OcrProcessor();
@@ -55,6 +55,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
   int _currentPage = 0;
   String _currentText = '';
   String? _currentPhonemes;
+  List<String> _sentences = [];
+  int _activeSentenceIndex = 0;
   double _playbackSpeed = 1.0;
   
   // Calibration preview (for bottom sheet)
@@ -66,6 +68,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _book = widget.book;
     _currentPage = _book.currentPage;
     _tempHeaderCutoff = _book.headerCutoff;
@@ -75,6 +78,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _calibrationPageImage?.dispose();
     _calibrationDisplayImage?.dispose();
     _currentPageImage?.dispose();
@@ -83,6 +87,19 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _ocrProcessor.dispose();
     _ttsEngine.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Pause TTS when app is backgrounded to prevent crashes on return
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      if (_ttsEngine.status == TtsStatus.speaking) {
+        _ttsEngine.pause();
+      } else if (_ttsEngine.status == TtsStatus.generating) {
+        _ttsEngine.stop();
+      }
+    }
   }
 
   Future<void> _initializeAll() async {
@@ -174,6 +191,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
           }
         }
       });
+
+      // Listen to sentence index for highlighting
+      _ttsEngine.sentenceIndexStream.listen((index) {
+        if (mounted) {
+          setState(() => _activeSentenceIndex = index);
+        }
+      });
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -246,8 +270,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
       if (cachedPage != null && cachedPage.text.isNotEmpty) {
         _currentText = cachedPage.text;
         _currentPhonemes = cachedPage.phonemes;
+        _sentences = TtsEngine.splitSentences(_currentText);
+        _activeSentenceIndex = 0;
         debugPrint('[Reader] Page $_currentPage loaded from DB cache '
-            '(${_currentText.length} chars'
+            '(${_currentText.length} chars, ${_sentences.length} sentences'
             '${_currentPhonemes != null ? ', ${_currentPhonemes!.length} phoneme chars' : ', no phonemes'}'
             ')');
         setState(() => _isProcessingPage = false);
@@ -320,7 +346,16 @@ class _ReaderScreenState extends State<ReaderScreen> {
       if (_selectedVoice != null) {
         _ttsEngine.setVoice(_selectedVoice!);
       }
-      await _ttsEngine.speak(_currentText, prePhonemes: _currentPhonemes);
+      // Split into sentences if not already done
+      if (_sentences.isEmpty && _currentText.isNotEmpty) {
+        _sentences = TtsEngine.splitSentences(_currentText);
+      }
+      setState(() => _activeSentenceIndex = 0);
+      await _ttsEngine.speak(
+        _currentText,
+        prePhonemes: _currentPhonemes,
+        sentences: _sentences.isNotEmpty ? _sentences : null,
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -346,6 +381,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _currentPage++;
       _currentText = '';
       _currentPhonemes = null;
+      _sentences = [];
+      _activeSentenceIndex = 0;
     });
     
     // Load new page image
@@ -369,6 +406,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _currentPage--;
       _currentText = '';
       _currentPhonemes = null;
+      _sentences = [];
+      _activeSentenceIndex = 0;
     });
     
     // Load new page image
@@ -393,6 +432,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _currentPage = page;
       _currentText = '';
       _currentPhonemes = null;
+      _sentences = [];
+      _activeSentenceIndex = 0;
     });
     
     // Load new page image
@@ -407,19 +448,75 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _ttsEngine.setRate(speed);
   }
 
+  /// Builds the sentence display panel with the active sentence highlighted.
+  /// Shows all sentences as flowing text with the current one in a different style.
+  Widget _buildSentencePanel(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final scrollController = ScrollController();
+
+    // Build a RichText with all sentences, highlighting the active one
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: ListView.builder(
+          controller: scrollController,
+          padding: const EdgeInsets.all(16),
+          itemCount: 1,
+          itemBuilder: (context, _) {
+            return RichText(
+              text: TextSpan(
+                children: List.generate(_sentences.length, (i) {
+                  final isActive = i == _activeSentenceIndex;
+                  final isPast = i < _activeSentenceIndex;
+                  return TextSpan(
+                    text: '${_sentences[i]}${i < _sentences.length - 1 ? ' ' : ''}',
+                    style: TextStyle(
+                      fontSize: 15,
+                      height: 1.6,
+                      color: isActive
+                          ? colorScheme.onSurface
+                          : isPast
+                              ? colorScheme.onSurface.withValues(alpha: 0.4)
+                              : colorScheme.onSurface.withValues(alpha: 0.6),
+                      fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+                      backgroundColor: isActive
+                          ? colorScheme.primary.withValues(alpha: 0.15)
+                          : null,
+                    ),
+                  );
+                }),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
   Widget _buildProgressSection(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     
     if (_isProcessingPage) {
-      // Extracting text from page
       return const LinearProgressIndicator();
     }
     
-    // Page progress bar (always visible, simple and reliable)
-    return LinearProgressIndicator(
-      value: _totalPages > 0
+    // During playback, show sentence progress; otherwise show page progress
+    final double progress;
+    if ((_isPlaying || _isGenerating) && _sentences.isNotEmpty) {
+      progress = ((_activeSentenceIndex + 1) / _sentences.length).clamp(0.0, 1.0);
+    } else {
+      progress = _totalPages > 0
           ? ((_currentPage + 1) / _totalPages).clamp(0.0, 1.0)
-          : 0.0,
+          : 0.0;
+    }
+    
+    return LinearProgressIndicator(
+      value: progress,
       backgroundColor: colorScheme.surface,
     );
   }
@@ -630,9 +727,16 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
             // PDF Page Display (centered, takes most of the space)
             Expanded(
-              flex: 5,
+              flex: (_isPlaying || _isGenerating) && _sentences.isNotEmpty ? 3 : 5,
               child: _buildPdfPageView(),
             ),
+
+            // Sentence display panel (visible during playback)
+            if ((_isPlaying || _isGenerating) && _sentences.isNotEmpty)
+              Expanded(
+                flex: 2,
+                child: _buildSentencePanel(context),
+              ),
             
             const SizedBox(height: 16),
 

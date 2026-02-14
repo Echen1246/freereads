@@ -29,11 +29,11 @@
 ## Architecture
 
 ```
-Phase A: Ingestion
-PDF → pdfrx → Bitmap → ML Kit OCR → TextBlocks + Rects → Page Sorter → SQLite
+Phase A: Import (one-time per book)
+PDF -> pdfrx native text extraction -> Page Sorter -> espeak-ng phonemization -> SQLite
 
 Phase B: Playback
-SQLite → Text Chunk → Kokoro TTS → PCM Audio → SoLoud → Speaker
+SQLite (pre-phonemized text) -> Kokoro ONNX (background thread) -> PCM -> SoLoud -> Speaker
 ```
 
 ## Setup
@@ -77,19 +77,19 @@ flutter run -d ios
 lib/
 ├── main.dart                    # App entry point
 ├── core/
-│   ├── ocr_processor.dart       # ML Kit wrapper
-│   ├── page_sorter.dart         # Heuristic text sorting
-│   ├── pdf_renderer.dart        # pdfrx wrapper
-│   └── tts_engine.dart          # Kokoro + SoLoud integration
+│   ├── espeak_phonemizer.dart   # espeak-ng FFI bindings + misaki conversion
+│   ├── ocr_processor.dart       # ML Kit wrapper (fallback for scanned PDFs)
+│   ├── page_sorter.dart         # Text reflow and reading order
+│   ├── pdf_renderer.dart        # pdfrx wrapper + native text extraction
+│   └── tts_engine.dart          # Kokoro + SoLoud interleaved pipeline
 ├── data/
 │   ├── database.dart            # SQLite operations
 │   └── models/
 │       ├── book.dart            # Book entity
-│       └── page_text.dart       # Page text entity
+│       └── page_text.dart       # Page text + pre-phonemized data
 ├── ui/
-│   ├── home_screen.dart         # Entry screen
-│   ├── calibration_screen.dart  # PDF zone calibration
-│   └── player_screen.dart       # Audio playback
+│   ├── library_screen.dart      # Book library with import/processing
+│   └── reader_screen.dart       # PDF viewer + audio playback controls
 └── theme/
     └── app_theme.dart           # Dark theme styling
 ```
@@ -129,17 +129,15 @@ final wav = createWavFromPcm(pcm, sampleRate: 24000);
 await soloud.loadMem('audio.wav', wav);
 ```
 
-## MVP "Trace Bullet" Scope
+## MVP Scope
 
-This MVP proves the vertical slice:
-
-1. ✅ Load sample PDF from assets
-2. ✅ Render page and display
-3. ✅ Draggable calibration overlays
-4. ✅ Run OCR with zone filtering
-5. ✅ Sort text in reading order
-6. ✅ Pass to TTS engine
-7. ✅ Stream audio to speaker
+1. Load sample PDF from assets
+2. Render page and display
+3. Draggable calibration overlays
+4. Run OCR with zone filtering
+5. Sort text in reading order
+6. Pass to TTS engine
+7. Stream audio to speaker
 
 ## License
 
