@@ -400,19 +400,29 @@ class TtsEngine {
     }
   }
 
-  /// Splits text into sentences at sentence-ending punctuation (.!?).
-  /// Returns a list of sentences preserving original whitespace and punctuation.
+  /// Splits text into sentences at sentence-ending punctuation (.!?) and
+  /// paragraph breaks (\n\n).  Paragraph breaks are detected from the PDF
+  /// text extraction step (structural gaps between fragments like headings
+  /// and body text) and produce natural pauses in the TTS output.
   static List<String> splitSentences(String text) {
     final sentences = <String>[];
-    final pattern = RegExp(r'(?<=[.!?])\s+');
-    final parts = text.split(pattern);
-    for (final part in parts) {
-      final trimmed = part.trim();
-      if (trimmed.isNotEmpty) {
-        sentences.add(trimmed);
+
+    // First split at paragraph breaks (structural gaps from PDF extraction)
+    final paragraphs = text.split(RegExp(r'\n\s*\n'));
+
+    for (final paragraph in paragraphs) {
+      // Then split each paragraph at sentence-ending punctuation
+      final pattern = RegExp(r'(?<=[.!?])\s+');
+      final parts = paragraph.split(pattern);
+      for (final part in parts) {
+        final trimmed = part.trim();
+        if (trimmed.isNotEmpty) {
+          sentences.add(trimmed);
+        }
       }
     }
-    // If no sentence-ending punctuation was found, treat the whole text as one sentence
+
+    // If nothing was found, treat the whole text as one sentence
     if (sentences.isEmpty && text.trim().isNotEmpty) {
       sentences.add(text.trim());
     }
@@ -463,9 +473,11 @@ class TtsEngine {
       // batchSentenceStart[i] = first sentence index covered by batch i
       final List<int> batchSentenceStart;
 
-      if (prePhonemes != null && prePhonemes.isNotEmpty && sentences != null) {
-        // Fast path: phonemize each sentence individually so we can track
-        // which sentences map to which batches.
+      if (sentences != null && sentences.isNotEmpty && _useEspeak) {
+        // Sentence tracking path: phonemize each sentence individually so we
+        // can track which sentences map to which batches. Works regardless of
+        // whether prePhonemes is provided -- the per-sentence espeak calls are
+        // fast (~sub-ms each).
         final sentencePhonemes = <String>[];
         for (final s in sentences) {
           final ph = EspeakPhonemizer.phonemize(s);

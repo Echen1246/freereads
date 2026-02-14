@@ -62,3 +62,6 @@ flutter:
     - assets/tokenizer_vocab.json
     # espeak-ng phonemizer data (extracted on first launch)
     - assets/espeak-ng-data.zip
+    # Misaki pronunciation lexicons (word -> phoneme mappings for Kokoro)
+    - assets/us_gold.json
+    - assets/us_silver.json

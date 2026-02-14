@@ -1,8 +1,10 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:archive/archive.dart';
@@ -77,6 +79,14 @@ class EspeakPhonemizer {
   static EspeakSetVoiceByNameDart? _setVoiceByName;
   static EspeakTextToPhonemesDart? _textToPhonemes;
   static EspeakTerminateDart? _terminate;
+
+  /// Pronunciation lexicon: word (lowercase) -> misaki phonemes.
+  /// Loaded from misaki's us_gold.json and us_silver.json at init time.
+  /// Gold entries override silver (higher quality, curated).
+  static Map<String, String> _lexicon = {};
+
+  /// Number of lexicon entries loaded (for logging)
+  static int get lexiconSize => _lexicon.length;
 
   /// Check if the phonemizer is ready
   static bool get isInitialized => _initialized;
@@ -195,12 +205,56 @@ class EspeakPhonemizer {
       _setVoiceByName!(voicePtr);
       calloc.free(voicePtr);
 
+      // Load pronunciation lexicons (misaki us_gold + us_silver)
+      await _loadLexicon();
+
       _initialized = true;
       return true;
     } catch (e, stack) {
       print('[EspeakPhonemizer] Initialize error: $e');
       print(stack);
       return false;
+    }
+  }
+
+  /// Load misaki pronunciation lexicons from assets.
+  /// Silver is loaded first (auto-generated), then gold overrides (curated).
+  /// Gold entries may have POS-dependent forms; we take the DEFAULT value.
+  static Future<void> _loadLexicon() async {
+    _lexicon = {};
+
+    try {
+      // Silver: all lowercase, simple string values
+      final silverJson = await rootBundle.loadString('assets/us_silver.json');
+      final silverMap = jsonDecode(silverJson) as Map<String, dynamic>;
+      for (final entry in silverMap.entries) {
+        if (entry.value is String) {
+          _lexicon[entry.key.toLowerCase()] = entry.value as String;
+        }
+      }
+      debugPrint('[EspeakPhonemizer] Loaded ${silverMap.length} silver entries');
+
+      // Gold: may have POS-dependent entries like {"DEFAULT": "...", "NOUN": null}
+      final goldJson = await rootBundle.loadString('assets/us_gold.json');
+      final goldMap = jsonDecode(goldJson) as Map<String, dynamic>;
+      int goldOverrides = 0;
+      for (final entry in goldMap.entries) {
+        String? phonemes;
+        if (entry.value is String) {
+          phonemes = entry.value as String;
+        } else if (entry.value is Map) {
+          final posMap = entry.value as Map<String, dynamic>;
+          phonemes = posMap['DEFAULT'] as String?;
+        }
+        if (phonemes != null && phonemes.isNotEmpty) {
+          _lexicon[entry.key.toLowerCase()] = phonemes;
+          goldOverrides++;
+        }
+      }
+      debugPrint('[EspeakPhonemizer] Loaded $goldOverrides gold entries '
+          '(total lexicon: ${_lexicon.length} words)');
+    } catch (e) {
+      debugPrint('[EspeakPhonemizer] Lexicon load error (non-fatal): $e');
     }
   }
 
@@ -359,12 +413,57 @@ class EspeakPhonemizer {
     }
   }
   
-  /// Internal: phonemize a single text segment (no punctuation).
-  /// Returns raw espeak IPA with tie chars normalized to ^, then converted
-  /// to Kokoro's misaki phoneme vocabulary.
+  /// Pattern for stripping leading/trailing punctuation from a word for lookup.
+  static final _wordPunctuation = RegExp(r"""^['"()\[\]{}<>]+|['"()\[\]{}<>]+$""");
+
+  /// Internal: phonemize a text segment (no sentence-ending punctuation).
+  /// Uses a word-by-word strategy: check the misaki lexicon first, fall back
+  /// to espeak + _fromEspeak conversion for unknown words.
   static String? _phonemizeSegment(String text) {
     if (text.isEmpty) return '';
-    
+
+    // Split into words
+    final words = text.split(RegExp(r'\s+'));
+    final phonemeWords = <String>[];
+    int lexHits = 0;
+    int espeakFallbacks = 0;
+
+    for (final word in words) {
+      if (word.isEmpty) continue;
+
+      // Strip surrounding quotes/brackets for lookup, keep for context
+      final stripped = word.replaceAll(_wordPunctuation, '');
+      if (stripped.isEmpty) continue;
+
+      // Try lexicon lookup (case-insensitive)
+      final lexPhonemes = _lexicon[stripped.toLowerCase()];
+      if (lexPhonemes != null) {
+        phonemeWords.add(lexPhonemes);
+        lexHits++;
+        continue;
+      }
+
+      // Fall back to espeak for this word
+      final espeakResult = _espeakPhonemize(stripped);
+      if (espeakResult != null && espeakResult.isNotEmpty) {
+        phonemeWords.add(espeakResult);
+        espeakFallbacks++;
+      }
+    }
+
+    if (words.length > 1) {
+      debugPrint('[Phonemizer] ${words.length} words: '
+          '$lexHits lexicon, $espeakFallbacks espeak');
+    }
+
+    return phonemeWords.join(' ');
+  }
+
+  /// Phonemize a single word or short phrase via espeak-ng FFI.
+  /// Returns misaki-compatible phonemes (raw espeak IPA converted).
+  static String? _espeakPhonemize(String text) {
+    if (text.isEmpty) return '';
+
     // Prepare text pointer (espeak modifies this pointer as it consumes text)
     final textPtr = text.toNativeUtf8();
     final textPtrPtr = calloc<Pointer<Utf8>>();
@@ -391,7 +490,7 @@ class EspeakPhonemizer {
       if (textPtrPtr.value == nullptr || textPtrPtr.value.address == 0) {
         break;
       }
-      
+
       // Safety check for the remaining text
       try {
         final remaining = textPtrPtr.value.toDartString();
@@ -406,14 +505,14 @@ class EspeakPhonemizer {
     calloc.free(textPtrPtr);
     // Note: resultPtr is managed by espeak, don't free it
 
-    // Convert raw espeak IPA → Kokoro misaki phonemes
+    // Convert raw espeak IPA -> Kokoro misaki phonemes
     String rawPhonemes = phonemeBuffer.toString().trim();
-    // Normalize tie bar U+0361 → ^ for consistent replacement matching
+    if (rawPhonemes.isEmpty) return '';
+
+    // Normalize tie bar U+0361 -> ^ for consistent replacement matching
     rawPhonemes = rawPhonemes.replaceAll(_tie, _tieReplace);
-    
-    final bool british = false; // We use American English
-    final misakiPhonemes = _fromEspeak(rawPhonemes, british: british);
-    
+
+    final misakiPhonemes = _fromEspeak(rawPhonemes, british: false);
     return misakiPhonemes;
   }
 

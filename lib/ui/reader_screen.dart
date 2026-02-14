@@ -58,6 +58,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   List<String> _sentences = [];
   int _activeSentenceIndex = 0;
   double _playbackSpeed = 1.0;
+  bool _showCaptions = true;
+
+  // Continuous playback: maps each sentence index to its source page number
+  List<int> _sentencePageMap = [];
+  final ScrollController _sentencePanelScrollController = ScrollController();
   
   // Calibration preview (for bottom sheet)
   PdfImage? _calibrationPageImage;
@@ -79,6 +84,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _sentencePanelScrollController.dispose();
     _calibrationPageImage?.dispose();
     _calibrationDisplayImage?.dispose();
     _currentPageImage?.dispose();
@@ -192,11 +198,23 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         }
       });
 
-      // Listen to sentence index for highlighting
+      // Listen to sentence index for highlighting and auto page-flip
       _ttsEngine.sentenceIndexStream.listen((index) {
-        if (mounted) {
-          setState(() => _activeSentenceIndex = index);
+        if (!mounted) return;
+        // Check if we need to flip the PDF page
+        final needsPageFlip = index < _sentencePageMap.length &&
+            _sentencePageMap[index] != _currentPage;
+        setState(() {
+          _activeSentenceIndex = index;
+          if (needsPageFlip) {
+            _currentPage = _sentencePageMap[index];
+          }
+        });
+        if (needsPageFlip) {
+          _loadCurrentPageImage();
+          _database.updateCurrentPage(_book.id!, _currentPage);
         }
+        _scrollToActiveSentence();
       });
     } catch (e) {
       if (mounted) {
@@ -329,32 +347,61 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   Future<void> _startPlaying() async {
-    if (_currentText.isEmpty) {
-      await _processCurrentPage();
-    }
-    
-    if (_currentText.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No text found on this page')),
-        );
+    // Load all remaining pages from DB (current page onward) for continuous
+    // cross-page playback. This eliminates the gap/hitch at page boundaries.
+    final allPages = await _database.getAllPages(_book.id!);
+    final remainingSentences = <String>[];
+    final remainingPageMap = <int>[];
+
+    for (final page in allPages) {
+      if (page.pageNumber < _currentPage) continue;
+      if (page.text.isEmpty) continue;
+      final sentences = TtsEngine.splitSentences(page.text);
+      for (final s in sentences) {
+        remainingSentences.add(s);
+        remainingPageMap.add(page.pageNumber);
       }
-      return;
     }
-    
+
+    // Fallback: if no pre-extracted text in DB, try OCR for current page only
+    if (remainingSentences.isEmpty) {
+      await _processCurrentPage();
+      if (_currentText.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No text found on this page')),
+          );
+        }
+        return;
+      }
+      final sentences = TtsEngine.splitSentences(_currentText);
+      for (final s in sentences) {
+        remainingSentences.add(s);
+        remainingPageMap.add(_currentPage);
+      }
+    }
+
+    debugPrint('[Reader] Continuous playback: ${remainingSentences.length} sentences '
+        'across pages $_currentPage..${remainingPageMap.isNotEmpty ? remainingPageMap.last : _currentPage}');
+
+    setState(() {
+      _sentences = remainingSentences;
+      _sentencePageMap = remainingPageMap;
+      _activeSentenceIndex = 0;
+    });
+
+    // Reset scroll position
+    if (_sentencePanelScrollController.hasClients) {
+      _sentencePanelScrollController.jumpTo(0);
+    }
+
     try {
       if (_selectedVoice != null) {
         _ttsEngine.setVoice(_selectedVoice!);
       }
-      // Split into sentences if not already done
-      if (_sentences.isEmpty && _currentText.isNotEmpty) {
-        _sentences = TtsEngine.splitSentences(_currentText);
-      }
-      setState(() => _activeSentenceIndex = 0);
       await _ttsEngine.speak(
-        _currentText,
-        prePhonemes: _currentPhonemes,
-        sentences: _sentences.isNotEmpty ? _sentences : null,
+        remainingSentences.join(' '),
+        sentences: remainingSentences,
       );
     } catch (e) {
       if (mounted) {
@@ -366,10 +413,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   void _onPageFinished() {
-    // Auto-advance to next page
-    if (_currentPage < _totalPages - 1) {
-      _goToNextPage();
-    }
+    // In continuous mode, all remaining pages are played as one stream.
+    // The PDF page auto-advances via the sentence index listener, so
+    // there is nothing to do here when playback finishes naturally.
   }
 
   Future<void> _goToNextPage({bool autoPlay = true}) async {
@@ -382,6 +428,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _currentText = '';
       _currentPhonemes = null;
       _sentences = [];
+      _sentencePageMap = [];
       _activeSentenceIndex = 0;
     });
     
@@ -407,6 +454,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _currentText = '';
       _currentPhonemes = null;
       _sentences = [];
+      _sentencePageMap = [];
       _activeSentenceIndex = 0;
     });
     
@@ -433,6 +481,7 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       _currentText = '';
       _currentPhonemes = null;
       _sentences = [];
+      _sentencePageMap = [];
       _activeSentenceIndex = 0;
     });
     
@@ -448,13 +497,33 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     _ttsEngine.setRate(speed);
   }
 
-  /// Builds the sentence display panel with the active sentence highlighted.
-  /// Shows all sentences as flowing text with the current one in a different style.
+  /// Scrolls the sentence panel to keep the active sentence visible.
+  void _scrollToActiveSentence() {
+    if (!_sentencePanelScrollController.hasClients) return;
+    if (_sentences.isEmpty) return;
+
+    // Estimate: position the active sentence roughly 1/3 from the top.
+    // With individual sentence items averaging ~56px each, this gives a
+    // reasonable approximation.
+    const estimatedItemHeight = 56.0;
+    final targetOffset = _activeSentenceIndex * estimatedItemHeight -
+        (_sentencePanelScrollController.position.viewportDimension / 3);
+
+    _sentencePanelScrollController.animateTo(
+      targetOffset.clamp(
+        0.0,
+        _sentencePanelScrollController.position.maxScrollExtent,
+      ),
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+    );
+  }
+
+  /// Builds the sentence display panel (Spotify-style captions).
+  /// Each sentence is a separate item for reliable auto-scrolling.
   Widget _buildSentencePanel(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    final scrollController = ScrollController();
 
-    // Build a RichText with all sentences, highlighting the active one
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 16),
       decoration: BoxDecoration(
@@ -464,33 +533,67 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12),
         child: ListView.builder(
-          controller: scrollController,
-          padding: const EdgeInsets.all(16),
-          itemCount: 1,
-          itemBuilder: (context, _) {
-            return RichText(
-              text: TextSpan(
-                children: List.generate(_sentences.length, (i) {
-                  final isActive = i == _activeSentenceIndex;
-                  final isPast = i < _activeSentenceIndex;
-                  return TextSpan(
-                    text: '${_sentences[i]}${i < _sentences.length - 1 ? ' ' : ''}',
+          controller: _sentencePanelScrollController,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          itemCount: _sentences.length,
+          itemBuilder: (context, i) {
+            final isActive = i == _activeSentenceIndex;
+            final isPast = i < _activeSentenceIndex;
+
+            // Show a subtle page divider when crossing page boundaries
+            final showPageDivider = i > 0 &&
+                i < _sentencePageMap.length &&
+                _sentencePageMap.length > 1 &&
+                _sentencePageMap[i] != _sentencePageMap[i - 1];
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (showPageDivider)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Divider(
+                            color: colorScheme.outline.withValues(alpha: 0.2),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Text(
+                            'Page ${_sentencePageMap[i] + 1}',
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: colorScheme.onSurface.withValues(alpha: 0.35),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: Divider(
+                            color: colorScheme.outline.withValues(alpha: 0.2),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Text(
+                    _sentences[i],
                     style: TextStyle(
-                      fontSize: 15,
-                      height: 1.6,
+                      fontSize: isActive ? 16 : 14,
+                      height: 1.5,
                       color: isActive
                           ? colorScheme.onSurface
                           : isPast
-                              ? colorScheme.onSurface.withValues(alpha: 0.4)
-                              : colorScheme.onSurface.withValues(alpha: 0.6),
+                              ? colorScheme.onSurface.withValues(alpha: 0.35)
+                              : colorScheme.onSurface.withValues(alpha: 0.55),
                       fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
-                      backgroundColor: isActive
-                          ? colorScheme.primary.withValues(alpha: 0.15)
-                          : null,
                     ),
-                  );
-                }),
-              ),
+                  ),
+                ),
+              ],
             );
           },
         ),
@@ -716,6 +819,16 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                     ),
                   ),
                   const Spacer(),
+                  // Caption toggle (Spotify-style lyrics on/off)
+                  IconButton(
+                    icon: Icon(
+                      _showCaptions
+                          ? Icons.subtitles
+                          : Icons.subtitles_off_outlined,
+                    ),
+                    onPressed: () => setState(() => _showCaptions = !_showCaptions),
+                    tooltip: _showCaptions ? 'Hide captions' : 'Show captions',
+                  ),
                   IconButton(
                     icon: const Icon(Icons.tune),
                     onPressed: _showCalibrationSheet,
@@ -727,12 +840,12 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
 
             // PDF Page Display (centered, takes most of the space)
             Expanded(
-              flex: (_isPlaying || _isGenerating) && _sentences.isNotEmpty ? 3 : 5,
+              flex: _showCaptions && (_isPlaying || _isGenerating) && _sentences.isNotEmpty ? 3 : 5,
               child: _buildPdfPageView(),
             ),
 
-            // Sentence display panel (visible during playback)
-            if ((_isPlaying || _isGenerating) && _sentences.isNotEmpty)
+            // Sentence caption panel (Spotify-style, toggleable)
+            if (_showCaptions && (_isPlaying || _isGenerating) && _sentences.isNotEmpty)
               Expanded(
                 flex: 2,
                 child: _buildSentencePanel(context),

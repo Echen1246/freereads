@@ -149,12 +149,60 @@ class PdfRenderer {
       final minY = pageHeight * headerCutoff;   // bottom of header zone
       final maxY = pageHeight * footerCutoff;    // top of footer zone
 
-      final buf = StringBuffer();
+      // Collect fragments that pass the header/footer filter
+      final filteredFragments = <({String text, double top, double bottom})>[];
       for (final fragment in pageText.fragments) {
-        // Fragment center in PDF coords (bottom-up)
         final centerY = (fragment.bounds.top + fragment.bounds.bottom) / 2;
         if (centerY < minY || centerY > maxY) continue; // header/footer
-        buf.write(fragment.text);
+        filteredFragments.add((
+          text: fragment.text,
+          top: fragment.bounds.top,
+          bottom: fragment.bounds.bottom,
+        ));
+      }
+
+      if (filteredFragments.isEmpty) {
+        debugPrint('[PdfRenderer] Page $pageIndex: all fragments filtered out');
+        return null;
+      }
+
+      // Detect structural gaps between fragments.
+      // When the vertical gap between consecutive fragments is much larger
+      // than typical line spacing, insert a paragraph break (\n\n).
+      // This preserves heading/section pauses for the TTS engine.
+      final buf = StringBuffer();
+      double? prevBottom;
+      final lineGaps = <double>[];
+
+      // First pass: collect typical line gaps to compute a threshold
+      for (int i = 1; i < filteredFragments.length; i++) {
+        final gap = (filteredFragments[i].top - filteredFragments[i - 1].bottom).abs();
+        if (gap > 0 && gap < pageHeight * 0.3) {
+          lineGaps.add(gap);
+        }
+      }
+      // Median gap = typical line spacing; structural breaks are > 2x that
+      double gapThreshold = pageHeight * 0.05; // fallback: 5% of page height
+      if (lineGaps.length >= 3) {
+        lineGaps.sort();
+        final median = lineGaps[lineGaps.length ~/ 2];
+        gapThreshold = median * 2.5;
+      }
+
+      // Second pass: build text with paragraph breaks at structural gaps
+      for (int i = 0; i < filteredFragments.length; i++) {
+        final frag = filteredFragments[i];
+
+        if (prevBottom != null) {
+          final gap = (frag.top - prevBottom!).abs();
+          if (gap > gapThreshold) {
+            // Large gap detected -- structural break (heading, section, etc.)
+            buf.write('\n\n');
+          }
+        }
+
+        buf.write(frag.text);
+        prevBottom = frag.bottom;
       }
 
       final result = buf.toString().trim();
