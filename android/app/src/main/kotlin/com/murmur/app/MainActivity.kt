@@ -1,4 +1,4 @@
-package com.freereads.freereads
+package com.murmur.app
 
 import io.flutter.embedding.android.FlutterActivity
 
