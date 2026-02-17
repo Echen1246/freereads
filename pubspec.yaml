@@ -1,0 +1,90 @@
+name: freereads
+description: "Local-only audiobook app - convert PDFs to human-quality audio"
+publish_to: 'none'
+version: 1.0.1+2
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  
+  # PDF Rendering
+  pdfrx: ^1.0.97
+  
+  # OCR
+  google_mlkit_text_recognition: ^0.15.0
+  
+  # TTS (Kokoro + phonemization)
+  kokoro_tts_flutter: ^0.2.0+1
+  
+  # Audio playback
+  flutter_soloud: ^3.2.3
+  
+  # Storage
+  sqflite: ^2.4.2
+  
+  # File system utilities
+  path_provider: ^2.1.5
+  path: ^1.9.1
+  
+  # File picker for importing PDFs
+  file_picker: ^8.0.0
+  
+  # FFI for native library bindings (espeak-ng)
+  ffi: ^2.1.0
+  
+  # Archive extraction (for espeak-ng-data.zip)
+  archive: ^4.0.4
+  shared_preferences: ^2.5.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.4
+  flutter_native_splash: ^2.4.7
+
+# App icon configuration
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/murmur.png"
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: "assets/murmur.png"
+
+# Splash screen configuration
+flutter_native_splash:
+  color: "#000000"
+  image: "assets/murmur.png"
+  android: true
+  ios: true
+  android_12:
+    color: "#000000"
+    image: "assets/murmur.png"
+
+# Override with local patched versions
+dependency_overrides:
+  kokoro_tts_flutter:
+    path: packages/kokoro_tts_flutter
+  # Forked to run ONNX inference on a background thread (fixes device freezing)
+  flutter_onnxruntime:
+    path: packages/flutter_onnxruntime
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    # Phoneme-to-token mapping (required by Kokoro TTS)
+    - assets/tokenizer_vocab.json
+    # Misaki pronunciation lexicons (word -> phoneme mappings for Kokoro)
+    - assets/us_gold.json
+    - assets/us_silver.json
+    # App logo
+    - assets/murmur.png
+    # NOTE: model.onnx, voices.json, and espeak-ng-data.zip are delivered
+    # via Play Asset Delivery (modelAssets pack) to stay under the 200MB
+    # base module limit. They are copied to app files dir on first launch.
